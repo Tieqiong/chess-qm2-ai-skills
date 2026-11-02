@@ -40,28 +40,39 @@ def convert_edf_to_dials_mask(edf_file, output_mask, existing_dials_mask=None):
         data = img.data
     except ImportError:
         # Fallback to anaconda3_jpcr which has fabio preinstalled
-        import subprocess, tempfile
-        tmp_npy = tempfile.mktemp(suffix=".npy")
+        import subprocess
+        import tempfile
         jpcr_py = "/nfs/chess/sw/anaconda3_jpcr/bin/python"
-        cmd = f'{jpcr_py} -c "import fabio, numpy as np; np.save(\'{tmp_npy}\', fabio.open(\'{edf_file}\').data)"'
         sub_env = os.environ.copy()
         sub_env.pop("PYTHONPATH", None)
-        res = subprocess.call(cmd, shell=True, env=sub_env)
-        if res == 0 and os.path.exists(tmp_npy):
-            data = np.load(tmp_npy)
-            os.remove(tmp_npy)
-        else:
-            raise RuntimeError(f"Failed to read EDF mask {edf_file} using fabio.")
+        with tempfile.TemporaryDirectory(prefix="dials-edf-") as temp_dir:
+            tmp_npy = os.path.join(temp_dir, "mask.npy")
+            subprocess.run(
+                [jpcr_py, "-c",
+                 "import sys, fabio, numpy as np; "
+                 "np.save(sys.argv[2], fabio.open(sys.argv[1]).data)",
+                 edf_file, tmp_npy],
+                check=True, env=sub_env,
+            )
+            data = np.load(tmp_npy, allow_pickle=False)
 
     # EDF convention: 0 = valid / trusted, >0 = masked / untrusted
     trusted_np = (data == 0)
+    if trusted_np.ndim != 2:
+        raise ValueError("Expected a two-dimensional EDF detector mask")
     print(f"EDF dimensions: {data.shape}, Trusted pixels: {np.count_nonzero(trusted_np)} / {data.size}")
 
     if existing_dials_mask and os.path.exists(existing_dials_mask):
         print(f"Merging with existing DIALS mask: {existing_dials_mask}")
         with open(existing_dials_mask, "rb") as f:
             base_mask = pickle.load(f)
+        if len(base_mask) != 1:
+            raise ValueError("EDF conversion supports a single detector panel")
         base_np = base_mask[0].as_numpy_array()
+        if trusted_np.shape != base_np.shape:
+            raise ValueError(
+                f"EDF mask shape {trusted_np.shape} differs from DIALS mask {base_np.shape}"
+            )
         trusted_np = trusted_np & base_np
         print(f"Combined trusted pixels: {np.count_nonzero(trusted_np)} / {data.size}")
 

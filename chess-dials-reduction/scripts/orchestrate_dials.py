@@ -1,340 +1,324 @@
 #!/usr/bin/env python3
-"""
-orchestrate_dials.py: Unified orchestrator for CHESS ID4B/QM2 DIALS data reduction.
-Supports Stage 1 (Fast / Pilot: Import -> Mask -> Find Spots -> Index -> Bravais Evaluation)
-and Stage 2 (Heavy Compute: Refine -> Integrate -> Symmetrize -> Scale -> Dual SHELX Export).
+"""Reduce one calibrated CHESS rotation sweep and prepare refinement inputs.
 
-Author: Steven Gomez-Alvarado / CHESS Data Reduction Skills
+Stage 1: import, mask, find spots, index, assess Bravais settings.
+Stage 2: refine, integrate, choose intensity symmetry, scale, export.
+Different spindle settings must be imported/reduced separately; combine their
+integrated observations with dials.cosym/dials.scale after checking geometry.
 """
 
 import argparse
 import glob
+import math
 import os
+from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
-import sys
+import tempfile
 
 
 def parse_poni_origin(poni_path):
-    """
-    Extract DIALS detector panel origin from pyFAI .poni file.
-    
-    In pyFAI (C-order, meters):
-      Distance: sample-to-detector distance
-      Poni1: Y-axis (slow axis) beam centre
-      Poni2: X-axis (fast axis) beam centre
-      
-    In DIALS (laboratory frame, millimeters):
-      origin = (-Poni2 * 1000, +Poni1 * 1000, -Distance * 1000)
-    """
-    if not os.path.exists(poni_path):
-        raise FileNotFoundError(f"PONI file not found: {poni_path}")
+    """Convert an untilted PONI calibration in the documented QM2 frame.
 
-    dist, p1, p2 = None, None, None
-    with open(poni_path, "r") as f:
-        for line in f:
-            line_str = line.strip()
-            if line_str.lower().startswith("distance:"):
-                dist = float(line_str.split(":", 1)[1])
-            elif line_str.lower().startswith("poni1:"):
-                p1 = float(line_str.split(":", 1)[1])
-            elif line_str.lower().startswith("poni2:"):
-                p2 = float(line_str.split(":", 1)[1])
-
-    if dist is None or p1 is None or p2 is None:
+    This shortcut assumes the existing detector fast/slow axes already match
+    that frame. A rotated PONI needs a full detector model, not just an origin.
+    """
+    values = {}
+    with open(poni_path) as handle:
+        for line in handle:
+            key, separator, value = line.partition(":")
+            if separator and key.strip().lower() in {
+                "distance", "poni1", "poni2", "rot1", "rot2", "rot3"
+            }:
+                values[key.strip().lower()] = float(value.strip())
+    if not {"distance", "poni1", "poni2"} <= values.keys():
         raise ValueError(f"Could not parse Distance, Poni1, and Poni2 from {poni_path}")
+    if not all(math.isfinite(value) for value in values.values()) or values["distance"] <= 0:
+        raise ValueError("PONI calibration requires finite values and positive Distance")
+    if any(abs(values.get(key, 0.0)) > 1e-12 for key in ("rot1", "rot2", "rot3")):
+        raise ValueError(
+            "PONI has nonzero detector rotations; an origin-only conversion would lose "
+            "the tilt. Supply --geometry-phil with validated detector origin, fast_axis "
+            "and slow_axis instead of --poni-file."
+        )
+    return f"{-values['poni2'] * 1000:.6f},{values['poni1'] * 1000:.6f},{-values['distance'] * 1000:.6f}"
 
-    origin_str = f"{-p2 * 1000.0:.3f},{p1 * 1000.0:.3f},{-dist * 1000.0:.3f}"
-    return origin_str
 
+def run_cmd(argv, cwd=None, log_file=None, dials_env=None):
+    """Run literal arguments, optionally sourcing DIALS in bash first.
 
-def run_cmd(cmd, cwd=None, log_file=None):
-    """Execute a shell command with real-time output and error handling."""
-    print(f"\n[RUNNING]: {cmd}")
+    Pass data as positional arguments to bash; neither paths nor PHIL values
+    are interpolated into shell source. This also works when /bin/sh is dash.
+    """
+    if isinstance(argv, str):
+        raise TypeError("run_cmd requires an argument sequence, not shell source")
+    argv = [str(arg) for arg in argv]
+    command = argv
+    if dials_env:
+        command = ["bash", "-c", 'source "$1" && shift && exec "$@"',
+                   "dials-run", os.path.abspath(dials_env), *argv]
+    print(f"\n[RUNNING]: {shlex.join(argv)}", flush=True)
     if cwd:
-        print(f"[WORKING DIR]: {cwd}")
-
-    stdout_dest = subprocess.PIPE
-    stderr_dest = subprocess.STDOUT
-
+        print(f"[WORKING DIR]: {cwd}", flush=True)
     process = subprocess.Popen(
-        cmd,
-        shell=True,
-        cwd=cwd,
-        stdout=stdout_dest,
-        stderr=stderr_dest,
-        universal_newlines=True,
-        bufsize=1
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, bufsize=1,
     )
-
-    log_handle = open(log_file, "a") if log_file else None
-
     output_lines = []
-    for line in iter(process.stdout.readline, ""):
-        print(line, end="")
-        output_lines.append(line)
+    log_handle = open(log_file, "a") if log_file else None
+    try:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            if log_handle:
+                log_handle.write(line)
+                log_handle.flush()
+    finally:
+        process.stdout.close()
         if log_handle:
-            log_handle.write(line)
-            log_handle.flush()
-
-    process.stdout.close()
+            log_handle.close()
     return_code = process.wait()
-    if log_handle:
-        log_handle.close()
-
-    if return_code != 0:
-        raise RuntimeError(f"Command failed with exit code {return_code}: {cmd}")
-
+    if return_code:
+        raise RuntimeError(f"Command failed with exit code {return_code}: {shlex.join(argv)}")
     return "".join(output_lines)
 
 
-def stage_1(args):
-    """Execute Stage 1: Import, Masking, Find Spots, Index, and Bravais Settings."""
-    work_dir = os.path.abspath(args.work_dir)
-    os.makedirs(work_dir, exist_ok=True)
-    dials_env = f"source {args.dials_env}"
-
-    print("=================================================================")
-    print("=== DIALS Reduction Pipeline: Stage 1 (Interactive Verification) ===")
-    print(f"Working Directory: {work_dir}")
-    print("=================================================================")
-
-    # 1. Discover raw scan folders / CBF files
-    cbf_inputs = []
-    if args.raw_dir:
-        raw_dir = os.path.abspath(args.raw_dir)
-        subdirs = sorted([d for d in glob.glob(os.path.join(raw_dir, "*")) if os.path.isdir(d)])
-        if subdirs:
-            print(f"Found {len(subdirs)} scan directories in {raw_dir}:")
-            for sd in subdirs:
-                print(f"  - {os.path.basename(sd)}")
-                cbf_inputs.append(f"{sd}/*.cbf")
-        else:
-            cbf_inputs.append(f"{raw_dir}/*.cbf")
-    elif args.cbf_pattern:
-        cbf_inputs = [args.cbf_pattern]
+def discover_sweep(raw_dir=None, cbf_pattern=None):
+    """Discover a single CBF filename series, refusing mixed sweep geometry."""
+    if bool(raw_dir) == bool(cbf_pattern):
+        raise ValueError("Provide exactly one of --raw-dir or --cbf-pattern")
+    if raw_dir:
+        directory = Path(raw_dir).expanduser().resolve()
+        files = list(directory.glob("*.cbf")) + list(directory.glob("*/*.cbf"))
     else:
-        raise ValueError("Must provide either --raw-dir or --cbf-pattern.")
-
-    input_str = " ".join(cbf_inputs)
-
-    # Resolve detector origin
-    detector_origin = args.detector_origin
-    if not detector_origin and args.poni_file:
-        print(f"Extracting calibrated detector origin from PONI: {args.poni_file}")
-        detector_origin = parse_poni_origin(args.poni_file)
-        print(f"  Calculated DIALS detector origin: {detector_origin}")
-
-    # 1. dials.import
-    import_parts = [
-        f"{dials_env}",
-        "&& dials.import",
-        input_str,
-        f"geometry.goniometer.axes={args.goniometer_axes}"
-    ]
-    if detector_origin:
-        import_parts.append(f'geometry.detector.panel.origin="{detector_origin}"')
-
-    import_cmd = " ".join(import_parts)
-    run_cmd(import_cmd, cwd=work_dir)
-
-    # 2. Mask generation
-    mask_file = os.path.join(work_dir, "pixels.mask")
-    gen_mask_cmd = f"{dials_env} && dials.generate_mask imported.expt output.mask={mask_file}"
-    run_cmd(gen_mask_cmd, cwd=work_dir)
-
-    if args.edf_mask and os.path.exists(args.edf_mask):
-        print(f"Combining with beamline calibration EDF mask: {args.edf_mask}")
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        combine_cmd = (
-            f"{dials_env} && dials.python {os.path.join(script_dir, 'mask_to_dials.py')} "
-            f"--edf {args.edf_mask} --out {mask_file} --combine-with {mask_file}"
+        files = [Path(path).resolve() for path in glob.glob(os.path.expanduser(cbf_pattern))]
+    files = sorted({path for path in files if path.is_file()})
+    if not files:
+        raise ValueError("No CBF files matched the supplied input")
+    # DIALS identifies rotation series by a numeric image suffix. Conservatively
+    # reject multiple directories or prefixes rather than reuse one spindle axis.
+    series = {(path.parent, re.sub(r"\d+(?=\.cbf$)", "#", path.name)) for path in files}
+    if len(series) != 1:
+        raise ValueError(
+            "Input contains multiple CBF sweeps. Run stage1/stage2 in a separate "
+            "work directory for each sweep with its calibrated --goniometer-axes; "
+            "then align integrated sweeps with dials.cosym and scale them jointly."
         )
-        run_cmd(combine_cmd, cwd=work_dir)
+    return [str(path) for path in files]
 
-    # 3. Create or verify find_spots.phil
-    phil_path = os.path.join(work_dir, "find_spots.phil")
-    if not os.path.exists(phil_path):
-        print(f"Writing default calibrated spotfinder PHIL: {phil_path}")
-        with open(phil_path, "w") as f:
-            f.write(f"""spotfinder {{
-  threshold {{
-    dispersion {{
-      gain = {args.gain}
-      global_threshold = {args.global_threshold}
-    }}
-  }}
-}}
-""")
 
-    # 4. dials.find_spots (multiprocessing enabled)
-    find_spots_cmd = (
-        f"{dials_env} && dials.find_spots {phil_path} imported.expt "
-        f"mask={mask_file} spotfinder.filter.d_min={args.d_min} mp.nproc={args.nproc}"
-    )
-    run_cmd(find_spots_cmd, cwd=work_dir)
+def normalized_cell(value):
+    """Accept comma- or whitespace-separated cell parameters consistently."""
+    if not value:
+        return None
+    numbers = [float(part) for part in re.split(r"[,\s]+", value.strip())]
+    if len(numbers) != 6 or not all(math.isfinite(x) and x > 0 for x in numbers):
+        raise ValueError("Unit cell requires six finite positive parameters: a,b,c,alpha,beta,gamma")
+    if any(angle >= 180 for angle in numbers[3:]):
+        raise ValueError("Unit-cell angles must be smaller than 180 degrees")
+    return ",".join(str(number) for number in numbers)
 
-    # 5. dials.index
-    # Note: Unconstrained auto-indexing is preferred to allow discovery of supercells and true lattices
-    index_args = ["imported.expt", "strong.refl"]
+
+def stage_1(args):
+    """Import and index one sweep, then report candidate lattice settings."""
+    if args.constrain_symmetry and not (args.unit_cell and args.space_group):
+        raise ValueError("--constrain-symmetry requires both --unit-cell and --space-group")
+    cell = normalized_cell(args.unit_cell)
+    files = discover_sweep(args.raw_dir, args.cbf_pattern)
+    origin = args.detector_origin
+    if args.poni_file:
+        origin = parse_poni_origin(args.poni_file)
+    for label, path in (("EDF mask", args.edf_mask), ("geometry PHIL", args.geometry_phil)):
+        if path and not Path(path).is_file():
+            raise FileNotFoundError(f"{label} not found: {path}")
+    work_dir = Path(args.work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    def run(argv):
+        return run_cmd(argv, cwd=str(work_dir), dials_env=args.dials_env)
+
+    import_args = ["dials.import", *files]
+    if args.geometry_phil:
+        import_args.append(str(Path(args.geometry_phil).resolve()))
+    import_args.append(f"geometry.goniometer.axes={args.goniometer_axes}")
+    if origin:
+        import_args.append(f"geometry.detector.panel.origin={origin}")
+    run(import_args)
+
+    mask_file = work_dir / "pixels.mask"
+    run(["dials.generate_mask", "imported.expt", f"output.mask={mask_file}"])
+    script_dir = Path(__file__).resolve().parent
+    if args.edf_mask:
+        run(["dials.python", script_dir / "mask_to_dials.py", "--edf",
+             str(Path(args.edf_mask).resolve()), "--out", mask_file, "--combine-with", mask_file])
+
+    # Preserve optional user settings; explicit CLI threshold values take
+    # precedence on every run instead of silently reusing stale generated values.
+    phil_path = work_dir / "find_spots.phil"
+    spot_args = ["dials.find_spots"]
+    if phil_path.is_file():
+        spot_args.append(phil_path)
+    spot_args += ["imported.expt", f"mask={mask_file}",
+                  f"spotfinder.threshold.dispersion.gain={args.gain}",
+                  f"spotfinder.threshold.dispersion.global_threshold={args.global_threshold}",
+                  f"spotfinder.filter.d_min={args.d_min}", f"mp.nproc={args.nproc}"]
+    run(spot_args)
+    index_args = ["dials.index", "imported.expt", "strong.refl"]
     if args.constrain_symmetry:
-        if args.unit_cell and args.space_group:
-            index_args.append(f'indexing.known_symmetry.unit_cell="{args.unit_cell}"')
-            index_args.append(f'indexing.known_symmetry.space_group="{args.space_group}"')
-        else:
-            print("Warning: --constrain-symmetry requested but --unit-cell or --space-group is missing. Proceeding unconstrained.")
-    else:
-        print("Running unconstrained auto-indexing (discovers true lattice/superstructure without bias)...")
-
-    index_cmd = f"{dials_env} && dials.index {' '.join(index_args)}"
-    run_cmd(index_cmd, cwd=work_dir)
-
-    # 6. dials.refine_bravais_settings
-    bravais_cmd = f"{dials_env} && dials.refine_bravais_settings indexed.expt indexed.refl"
-    run_cmd(bravais_cmd, cwd=work_dir)
-
-    # 7. Evaluate Bravais settings using bravais_matcher.py
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    matcher_cmd = f"python3 {os.path.join(script_dir, 'bravais_matcher.py')} --log dials.refine_bravais_settings.log"
-    if args.unit_cell:
-        matcher_cmd += f' --target-cell "{args.unit_cell}"'
+        index_args += [f"indexing.known_symmetry.unit_cell={cell}",
+                       f"indexing.known_symmetry.space_group={args.space_group}"]
+    run(index_args)
+    run(["dials.refine_bravais_settings", "indexed.expt", "indexed.refl"])
+    matcher_args = ["dials.python", script_dir / "bravais_matcher.py",
+                    "--log", "dials.refine_bravais_settings.log"]
+    if cell:
+        matcher_args += ["--target-cell", cell]
     if args.space_group:
-        matcher_cmd += f' --target-lattice "{args.space_group}"'
-    run_cmd(matcher_cmd, cwd=work_dir)
-
-    print("\n=================================================================")
-    print("=== Stage 1 Complete. Review Bravais settings above before Stage 2 ===")
-    print("=================================================================\n")
+        matcher_args += ["--target-space-group", args.space_group]
+    run(matcher_args)
+    print("\nStage 1 complete. Review the lattice fit and reported cb_op before stage2.")
 
 
 def stage_2(args):
-    """Execute Stage 2: Refine, Integrate, Symmetrize, Scale, and Dual Export."""
-    work_dir = os.path.abspath(args.work_dir)
-    dials_env = f"source {args.dials_env}"
-
-    print("=================================================================")
-    print("=== DIALS Reduction Pipeline: Stage 2 (Integration & Export) ===")
-    print(f"Working Directory: {work_dir}")
-    print("=================================================================")
-
-    # 1. Re-indexing (if change of basis is required)
-    refl_file = "indexed.refl"
-    if args.cb_op and args.cb_op != "a,b,c":
-        print(f"Applying change of basis operator: {args.cb_op}")
-        reindex_cmd = f"{dials_env} && dials.reindex indexed.refl change_of_basis_op={args.cb_op} output.reflections=reindexed.refl"
-        run_cmd(reindex_cmd, cwd=work_dir)
-        refl_file = "reindexed.refl"
-
-    # Select target experiment file
+    """Refine/integrate, scale under a stated symmetry choice, and export."""
+    work_dir = Path(args.work_dir).resolve()
     bravais_expt = f"bravais_setting_{args.bravais_setting}.expt"
-    if not os.path.exists(os.path.join(work_dir, bravais_expt)):
+    if not (work_dir / bravais_expt).is_file():
         raise FileNotFoundError(f"Experiment file {bravais_expt} not found in {work_dir}")
 
-    # 2. dials.refine (fixed unit cell & scan_varying=False to prevent mosaicity/cell explosion)
-    refine_parts = [
-        f"{dials_env}",
-        f"&& dials.refine {bravais_expt} {refl_file}",
-        "scan_varying=False"
-    ]
+    def run(argv):
+        return run_cmd(argv, cwd=str(work_dir), dials_env=args.dials_env)
+
+    refl_file = "indexed.refl"
+    if args.cb_op != "a,b,c":
+        run(["dials.reindex", refl_file, f"change_of_basis_op={args.cb_op}",
+             "output.reflections=reindexed.refl"])
+        refl_file = "reindexed.refl"
+    refine_args = ["dials.refine", bravais_expt, refl_file, f"scan_varying={args.scan_varying}"]
     if args.fix_cell:
-        refine_parts.append("refinement.parameterisation.crystal.fix=cell")
+        refine_args.append("refinement.parameterisation.crystal.fix=cell")
+    run(refine_args)
+    run(["dials.integrate", "refined.expt", "refined.refl", f"nproc={args.nproc}"])
 
-    refine_cmd = " ".join(refine_parts)
-    run_cmd(refine_cmd, cwd=work_dir)
+    scale_inputs = ["integrated.expt", "integrated.refl"]
+    if args.space_group:
+        run(["dials.reindex", *scale_inputs, f"space_group={args.space_group}",
+             "output.experiments=candidate.expt", "output.reflections=candidate.refl"])
+        scale_inputs = ["candidate.expt", "candidate.refl"]
+    elif not args.keep_input_symmetry:
+        run(["dials.symmetry", *scale_inputs])
+        scale_inputs = ["symmetrized.expt", "symmetrized.refl"]
+    scale_args = ["dials.scale", *scale_inputs,
+                  "overwrite_existing_models=True", f"anomalous={args.anomalous}"]
+    if args.scaling_model == "scale-only":
+        # KB with its B/decay term disabled is one scalar per dataset. A physical
+        # model without absorption/decay still fits a smooth scale versus phi.
+        scale_args += ["model=KB", "KB.decay_correction=False"]
+    else:
+        scale_args.append("model=physical")
+        if args.absorption_level == "none":
+            scale_args.append("physical.absorption_correction=False")
+        else:
+            scale_args += ["physical.absorption_correction=True",
+                           f"physical.absorption_level={args.absorption_level}"]
+    run(scale_args)
 
-    # 3. dials.integrate
-    integrate_cmd = f"{dials_env} && dials.integrate refined.expt refined.refl nproc={args.nproc}"
-    run_cmd(integrate_cmd, cwd=work_dir)
-
-    # 4. dials.symmetry
-    symm_cmd = f"{dials_env} && dials.symmetry integrated.expt integrated.refl"
-    run_cmd(symm_cmd, cwd=work_dir)
-
-    # 5. dials.scale
-    scale_cmd = (
-        f"{dials_env} && dials.scale symmetrized.expt symmetrized.refl "
-        f"overwrite_existing_models=True absorption_level={args.absorption_level} anomalous={args.anomalous}"
+    refinement_dir = work_dir / "for_refinement"
+    refinement_dir.mkdir(exist_ok=True)
+    unmerged_hkl, unmerged_ins = refinement_dir / "unmerged.hkl", refinement_dir / "unmerged.ins"
+    run(["dials.export", "scaled.expt", "scaled.refl", "format=shelx", "intensity=scale", "mtz.min_isigi=None",
+         f"shelx.composition={args.composition}", f"shelx.scale={args.shelx_scale}",
+         f"shelx.hklout={unmerged_hkl}", f"shelx.ins={unmerged_ins}"])
+    merged_mtz = refinement_dir / "merged.mtz"
+    # Keep the chosen symmetry unchanged while merging. IMEAN is explicitly a
+    # Friedel average; original observations and anomalous MTZ arrays remain.
+    run(["dials.merge", "scaled.expt", "scaled.refl", "output.html=None",
+         f"output.mtz={merged_mtz}", "assess_space_group=False", "truncate=False",
+         f"anomalous={args.anomalous}"])
+    merged_hkl = refinement_dir / "merged.hkl"
+    # The converter entry point can print some errors without a nonzero status.
+    # Verify a fresh temporary output before replacing an earlier derived file.
+    with tempfile.TemporaryDirectory(prefix=".shelx-merge-", dir=refinement_dir) as temporary:
+        candidate_hkl = Path(temporary) / "merged.hkl"
+        run(["iotbx.reflection_file_converter", merged_mtz, f"--shelx={candidate_hkl}",
+             "--label=IMEAN,SIGIMEAN"])
+        if not candidate_hkl.is_file() or not candidate_hkl.stat().st_size:
+            raise RuntimeError("MTZ-to-SHELX conversion did not produce a nonempty merged.hkl")
+        os.replace(candidate_hkl, merged_hkl)
+    shutil.copyfile(unmerged_ins, refinement_dir / "merged.ins")
+    (refinement_dir / "README.txt").write_text(
+        "unmerged.hkl: scaled observations, original Miller indices (HKLF 4).\n"
+        "merged.hkl: IMEAN/SIGIMEAN, symmetry- and Friedel-averaged intensities.\n"
+        "merged.mtz: merged means and anomalous arrays when anomalous=True.\n"
+        "Use unmerged observations/anomalous arrays for anomalous differences;\n"
+        "the mean merged.hkl does not retain Bijvoet differences.\n"
+        f"Composition supplied to the SHELX exporter: {args.composition}\n"
+        "The .ins files are starting headers: review SFAC/UNIT, symmetry and chemistry.\n"
+        f"Geometry: scan_varying={args.scan_varying}, fix_cell={args.fix_cell}\n"
+        f"Scaling: {args.scaling_model}, absorption_level={args.absorption_level}\n"
+        f"SHELX format rescaling: {args.shelx_scale}; inspect intensity/sigma precision.\n"
+        "Good merging statistics alone do not determine whether anisotropy is structural.\n"
     )
-    run_cmd(scale_cmd, cwd=work_dir)
+    print(f"\nStage 2 complete: {refinement_dir}. Review README.txt and SHELX headers.")
 
-    # 6. Dual Export: for_refinement bundle
-    refinement_dir = os.path.join(work_dir, "for_refinement")
-    os.makedirs(refinement_dir, exist_ok=True)
 
-    print(f"\nExporting refinement reflection files to: {refinement_dir}")
-
-    # A. Unmerged SHELX (for Jana2020)
-    unmerged_cmd = (
-        f"{dials_env} && dials.export scaled.expt scaled.refl "
-        f"format=shelx composition={args.composition} shelx.scale=False output.reflections=unmerged.hkl output.experiment=unmerged.ins"
-    )
-    run_cmd(unmerged_cmd, cwd=work_dir)
-    shutil.move(os.path.join(work_dir, "unmerged.hkl"), os.path.join(refinement_dir, "unmerged.hkl"))
-    shutil.move(os.path.join(work_dir, "unmerged.ins"), os.path.join(refinement_dir, "unmerged.ins"))
-
-    # B. Merged SHELX (for Olex2 / SHELXL)
-    merge_cmd = f"{dials_env} && dials.merge scaled.expt scaled.refl output.html=None"
-    run_cmd(merge_cmd, cwd=work_dir)
-
-    merged_export_cmd = (
-        f"{dials_env} && dials.export merged.expt merged.refl "
-        f"format=shelx composition={args.composition} shelx.scale=False output.reflections=merged.hkl output.experiment=merged.ins"
-    )
-    run_cmd(merged_export_cmd, cwd=work_dir)
-    shutil.move(os.path.join(work_dir, "merged.hkl"), os.path.join(refinement_dir, "merged.hkl"))
-    shutil.move(os.path.join(work_dir, "merged.ins"), os.path.join(refinement_dir, "merged.ins"))
-
-    print("\n=================================================================")
-    print("=== Stage 2 Complete! Refinement files ready in for_refinement/ ===")
-    print(f"  Jana2020 Target: {os.path.join(refinement_dir, 'unmerged.ins')}, unmerged.hkl")
-    print(f"  Olex2 Target:    {os.path.join(refinement_dir, 'merged.ins')}, merged.hkl")
-    print("=================================================================\n")
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--work-dir", required=True)
+    common.add_argument("--dials-env", default="/nfs/chess/sw/dials_sgomezalvarado/dials_env.sh",
+                        help="Bash activation script for the DIALS environment")
+    p1 = subparsers.add_parser("stage1", parents=[common], help="Import/index one sweep")
+    source = p1.add_mutually_exclusive_group(required=True)
+    source.add_argument("--raw-dir", help="Single CBF sweep directory (or parent containing exactly one sweep)")
+    source.add_argument("--cbf-pattern", help="Glob matching one CBF filename series")
+    p1.add_argument("--goniometer-axes", default="0,-1,0", help="Calibrated axis for this sweep; nominal default 0,-1,0")
+    geometry = p1.add_mutually_exclusive_group()
+    geometry.add_argument("--detector-origin", help="Validated DIALS origin in mm; existing panel axes must already be correct")
+    geometry.add_argument("--poni-file", help="Untilted PONI calibration in the documented QM2 frame")
+    geometry.add_argument("--geometry-phil", help="Validated DIALS import PHIL with full detector origin and fast/slow axes")
+    p1.add_argument("--edf-mask")
+    p1.add_argument("--gain", type=float, default=1.0)
+    p1.add_argument("--global-threshold", type=int, default=5000, help="Starting spot threshold; adjust for the dataset")
+    p1.add_argument("--d-min", type=float, default=0.75, help="Spot-finding cutoff in Angstroms")
+    p1.add_argument("--nproc", type=int, default=32)
+    p1.add_argument("--unit-cell", help="Target cell: a,b,c,alpha,beta,gamma (spaces also accepted)")
+    p1.add_argument("--space-group", help="Target group for Bravais ranking; not imposed unless --constrain-symmetry")
+    p1.add_argument("--constrain-symmetry", action="store_true")
+    p2 = subparsers.add_parser("stage2", parents=[common], help="Refine/integrate/scale/export")
+    p2.add_argument("--bravais-setting", type=int, required=True)
+    p2.add_argument("--cb-op", default="a,b,c")
+    p2.add_argument("--nproc", type=int, default=32)
+    fixed = p2.add_mutually_exclusive_group()
+    fixed.add_argument("--fix-cell", dest="fix_cell", action="store_true", help="Keep the selected cell fixed (default)")
+    fixed.add_argument("--no-fix-cell", dest="fix_cell", action="store_false", help="Allow cell refinement")
+    p2.set_defaults(fix_cell=True)
+    p2.add_argument("--scan-varying", choices=["False", "True", "Auto"], default="False",
+                    help="Static starting model by default; test variation when residuals justify it")
+    symmetry = p2.add_mutually_exclusive_group()
+    symmetry.add_argument("--keep-input-symmetry", action="store_true", help="Scale in selected Bravais model symmetry without automatic reassignment")
+    symmetry.add_argument("--space-group", help="Explicit compatible candidate space group for scaling")
+    p2.add_argument("--scaling-model", choices=["physical", "scale-only"], default="physical",
+                    help="scale-only uses KB with decay disabled: one scalar per dataset, no absorption")
+    p2.add_argument("--absorption-level", default="medium", choices=["none", "low", "medium", "high"])
+    p2.add_argument("--anomalous", default="True", choices=["True", "False"])
+    p2.add_argument("--composition", default="FeTe", help="SHELX asymmetric-unit contents or element list; review generated SFAC/UNIT (default elements: Fe, Te)")
+    p2.add_argument("--shelx-scale", default="False", choices=["True", "False"],
+                    help="Export-format rescaling only; False avoids the DIALS 3.30.1 sign bug, but check output precision")
+    return parser
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified CHESS DIALS Data Reduction Orchestrator.")
-    subparsers = parser.add_subparsers(dest="subcommand", required=True)
-
-    # Common parameters
-    common_args = argparse.ArgumentParser(add_help=False)
-    common_args.add_argument("--work-dir", required=True, help="Working directory for data reduction")
-    common_args.add_argument(
-        "--dials-env",
-        default="/nfs/chess/sw/dials_sgomezalvarado/dials_env.sh",
-        help="Path to dials_env.sh activation script"
-    )
-
-    # Subcommand: stage1
-    p1 = subparsers.add_parser("stage1", parents=[common_args], help="Run Stage 1: Import, Spotfinding, Index, Bravais")
-    p1.add_argument("--raw-dir", help="Path to raw scans directory (e.g. .../raw6M/sample/mount/temp/)")
-    p1.add_argument("--cbf-pattern", help="Direct CBF glob pattern (e.g. '/path/to/*.cbf')")
-    p1.add_argument("--goniometer-axes", default="0,-1,0", help="Rotation axis in laboratory frame (default: 0,-1,0)")
-    p1.add_argument("--detector-origin", help="Panel origin: '-Poni2*1000,Poni1*1000,-Distance*1000' (e.g. -208.324,205.764,-499.430)")
-    p1.add_argument("--poni-file", help="Path to pyFAI .poni calibration file (auto-calculates detector origin)")
-    p1.add_argument("--edf-mask", help="Path to beamline calibration EDF mask (e.g. mask_trans.edf)")
-    p1.add_argument("--gain", type=float, default=1.0, help="Spotfinder detector gain")
-    p1.add_argument("--global-threshold", type=int, default=5000, help="Spotfinder global intensity threshold")
-    p1.add_argument("--d-min", type=float, default=0.75, help="High-resolution spotfinder filter cut-off in Angstroms")
-    p1.add_argument("--nproc", type=int, default=32, help="Number of CPU cores for parallel spot finding")
-    p1.add_argument("--unit-cell", help="Target unit cell for Bravais ranking: 'a b c alpha beta gamma'")
-    p1.add_argument("--space-group", help="Target space group symbol for Bravais ranking (e.g. P6322)")
-    p1.add_argument("--constrain-symmetry", action="store_true", help="Force indexing against known unit cell & space group (default: False)")
-
-    # Subcommand: stage2
-    p2 = subparsers.add_parser("stage2", parents=[common_args], help="Run Stage 2: Refine, Integrate, Scale, Export")
-    p2.add_argument("--bravais-setting", type=int, required=True, help="Chosen Bravais setting number (e.g. 12)")
-    p2.add_argument("--cb-op", default="a,b,c", help="Change of basis operator (e.g. -c,a,-b+c)")
-    p2.add_argument("--nproc", type=int, default=32, help="Number of CPU cores for parallel integration")
-    p2.add_argument("--fix-cell", action="store_true", default=True, help="Fix unit cell parameters during static refinement (default: True)")
-    p2.add_argument("--absorption-level", default="high", choices=["low", "medium", "high"], help="DIALS scale absorption correction")
-    p2.add_argument("--anomalous", default="True", choices=["True", "False"], help="Preserve anomalous Bijvoet pairs")
-    p2.add_argument("--composition", default="FeTe2", help="Chemical formula for SHELX SFAC/UNIT generation (e.g. K2Co2TeO6)")
-
+    parser = build_parser()
     args = parser.parse_args()
-
+    if args.nproc < 1:
+        parser.error("--nproc must be positive")
     if args.subcommand == "stage1":
         stage_1(args)
-    elif args.subcommand == "stage2":
+    else:
         stage_2(args)
 
 

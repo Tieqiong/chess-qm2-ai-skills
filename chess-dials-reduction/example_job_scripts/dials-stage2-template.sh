@@ -6,40 +6,28 @@
 #$ -j y
 #$ -o dials_stage2.log
 
-set -e
-export OMP_NUM_THREADS=${NSLOTS:-24}
-export MKL_NUM_THREADS=${NSLOTS:-24}
+set -euo pipefail
+# DIALS uses process workers; avoid multiplying each worker by NSLOTS threads.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+DIALS_ENV="${DIALS_ENV:-/nfs/chess/sw/dials_sgomezalvarado/dials_env.sh}"
+SKILLS_DIR="${SKILLS_DIR:-$HOME/.gemini/config/skills/chess-dials-reduction}"
 
-DIALS_ENV="/nfs/chess/sw/dials_sgomezalvarado/dials_env.sh"
-SKILLS_DIR="$HOME/.gemini/config/skills/chess-dials-reduction"
-
+if [ "$#" -lt 2 ]; then
+    echo "Usage: qsub dials-stage2-template.sh <work_dir> <bravais_setting> [cb_op] [asu_composition_or_elements] [extra options...]"
+    exit 1
+fi
 WORK_DIR="$1"
 BRAVAIS_SETTING="$2"
 CB_OP="${3:-a,b,c}"
-COMPOSITION="${4:-K2Co2TeO6}"
-
-if [ -z "$WORK_DIR" ] || [ -z "$BRAVAIS_SETTING" ]; then
-    echo "Usage: qsub dials-stage2-template.sh <work_dir> <bravais_setting> [cb_op] [composition]"
-    exit 1
-fi
-
-echo "=== Launching DIALS Stage 2 Batch Reduction on Compute Node: $(hostname) ==="
-date
-echo "Work Dir: $WORK_DIR"
-echo "Bravais Setting: $BRAVAIS_SETTING"
-echo "cb_op: $CB_OP"
-echo "Composition: $COMPOSITION"
-
-python3 $SKILLS_DIR/scripts/orchestrate_dials.py stage2 \
-    --work-dir "$WORK_DIR" \
-    --dials-env "$DIALS_ENV" \
-    --bravais-setting "$BRAVAIS_SETTING" \
-    --cb-op "$CB_OP" \
-    --composition "$COMPOSITION" \
-    --nproc ${NSLOTS:-24} \
-    --fix-cell \
-    --absorption-level high \
-    --anomalous True
-
-echo "=== DIALS Stage 2 Batch Reduction Completed Successfully ==="
-date
+COMPOSITION="${4:-KCoTeO}"
+shift "$(( $# < 4 ? $# : 4 ))"
+printf 'Launching DIALS Stage 2 on %s\n' "$(hostname)"
+python3 "$SKILLS_DIR/scripts/orchestrate_dials.py" stage2 \
+    --work-dir "$WORK_DIR" --dials-env "$DIALS_ENV" \
+    --bravais-setting "$BRAVAIS_SETTING" --cb-op "$CB_OP" \
+    --composition "$COMPOSITION" --nproc "${NSLOTS:-24}" \
+    --scan-varying False \
+    --scaling-model physical --absorption-level medium --anomalous True "$@"
+printf 'DIALS stage completed successfully\n'

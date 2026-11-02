@@ -48,272 +48,135 @@ source /nfs/chess/sw/dials_sgomezalvarado/dials_env.sh
 ```
 * Python tools interacting with DIALS internal C++ data structures (`scitbx.array_family.flex`, `dxtbx`) must be executed via `dials.python`.
 
-### 1.3 Laboratory Frame & Goniometer Geometry (Eulerian Cradle Spindle Tilt)
-At CHESS ID4B/QM2 with the Pilatus 6M detector in transmission geometry, the diffractometer utilizes a 4-circle Huber Eulerian cradle where Theta ($\theta$) rotates around vertical, Chi ($\chi$) tilts the cradle ring, and Phi ($\phi$) rotates the sample spindle.
+### 1.3 Laboratory Frame and Per-Sweep Geometry
 
-#### Nominal vs Multi-Sweep Tilts
-- For nominal transmission geometry ($\theta = 0^\circ, \chi = 90^\circ$), the rotation spindle points vertically downward:
-  ```text
-  geometry.goniometer.axes=0,-1,0
-  ```
-- **Multi-Sweep Collections**: When multiple sweeps are collected at distinct tilt angles ($\Delta\chi, \Delta\theta$) to increase reciprocal space coverage and eliminate blind spots, the spindle axis rotates away from $[0, -1, 0]$ according to Eulerian kinematics:
-  $$\vec{u}_{\text{DIALS}} = \begin{pmatrix} -\sin\theta \cos(\chi - 90^\circ) \\ -\cos\theta \cos(\chi - 90^\circ) \\ \sin(\chi - 90^\circ) \end{pmatrix}$$
-  *(Mapped to DIALS laboratory axes $+X$ horizontal right, $+Y$ vertically up, $+Z$ along beam away from source).*
+For nominal transmission geometry (theta=0, chi=90 degrees), the verified downward spindle convention is `geometry.goniometer.axes=0,-1,0`. For tilted sweeps, derive the axis from that run's motor conventions and verify predicted versus observed spots. Do not reuse the nominal vector for every sweep. The former Eulerian formula and numerical examples disagreed and have been removed; no unverified replacement convention is assumed.
 
-> [!CAUTION]
-> **Spindle Axis Misorientation Destroys Auto-Indexing!**
-> Omitting the calibrated spindle tilt for off-axis sweeps causes angular prediction errors of $5^\circ - 7^\circ$. Spot coordinates become severely distorted in reciprocal space, and auto-indexing fails completely across all algorithms (`fft3d`, `fft1d`, `real_space_grid_search`). Always extract motor angles from the SPEC scan file and calculate the exact spindle vector for each sweep:
-> - **Sweep 1** ($\theta = 0^\circ, \chi = 90^\circ$): `0.0, -1.0, 0.0`
-> - **Sweep 2** ($\theta = +3^\circ, \chi = 88^\circ$): `0.0348995, -0.9980212, -0.05230407`
-> - **Sweep 3** ($\theta = -3^\circ, \chi = 97^\circ$): `-0.12186934, -0.9911859, 0.05194585`
+The wrapper processes **one CBF sweep per working directory**. Reduce tilted sweeps separately using their calibrated axes; align their indexing and scale jointly afterward (section 4.4). Directory grouping alone is not evidence of common geometry or one crystal.
 
+### 1.4 Detector Calibration
 
-### 1.4 Critical Detector Calibration & Panel Origin
-> [!IMPORTANT]
-> **Raw Pilatus 6M CBF Headers Contain Stale Beam Center Values!**
-> - The mini-CBF header written by the detector computer frequently records a default uncalibrated beam centre: $(334.54, 433.44)\text{ mm}$ ($(1945, 2520)\text{ px}$).
-> - The true calibrated transmission beam centre from the pyFAI calibration (`ceO2_15keV_trans.poni`) is:
->   $$\text{Beam Centre} = (208.32, 205.76)\text{ mm} \quad ((1211.2, 1196.3)\text{ px}), \quad \text{Distance} = 499.43\text{ mm}$$
-> - **Converting pyFAI PONI to DIALS Panel Origin**:
->   In pyFAI (C-order, meters): $Poni_1$ is slow/Y axis, $Poni_2$ is fast/X axis, and $Distance$ is sample-to-detector distance.
->   In DIALS (laboratory frame, millimeters):
->   $$\text{origin} = (-Poni_2 \times 1000, \, +Poni_1 \times 1000, \, -Distance \times 1000)$$
->   *Example:* For `ceO2_15keV_trans.poni` ($Poni_1=0.205764$, $Poni_2=0.208324$, $Distance=0.499430$):
->   ```text
->   geometry.detector.panel.origin="-208.324,205.764,-499.430"
->   ```
-> - **Impact of Omission**: If this calibrated origin is omitted, DIALS attempts to fit spot centroids against predictions offset by $126\text{ mm}$. Mosaicity artificially inflates to $>2.5^\circ$, shoeboxes expand to $1583 \times 1646\text{ px} \times 295\text{ frames}$, and `dials.integrate` crashes with a catastrophic **`MemoryError` (180 GB shoebox memory)**.
+Check the run's CBF headers against its calibration, energy, detector position and raster convention. A stale beam centre can ruin indexing/profile estimation, but neither a header nor a calibration from a different run is automatically correct.
 
----
+`--poni-file` implements the restricted, **zero-rotation** conversion
+`origin=(-1000*Poni2, +1000*Poni1, -1000*Distance)` for panel fast=+X, slow=-Y, incident beam toward -Z. PONI lengths are metres; DIALS lengths are millimetres. The wrapper now rejects nonzero Rot1/Rot2/Rot3 instead of silently discarding them.
 
-## 2. Directory Structure & File Conventions
+For a tilted detector, supply `--geometry-phil` containing the validated full detector origin and fast/slow axes in the image reader's convention. This is mutually exclusive with `--poni-file` and `--detector-origin`. Confirm the imported panel frame and beam direction. These options describe starting geometry; subsequent refinement can change it. Retain calibration-fixed controls when the absolute cell or geometry matters. See [refinement decisions](references/refinement_decisions.md).
 
-The DIALS reduction pipeline strictly mirrors the beamline's parallel directory hierarchy:
+## 2. Directory Conventions
 
-- **Raw CBF Scans**:
-  ```text
-  /nfs/chess/id4b/{cycle}/{experiment}/raw6M/{sample_name}/{sample_id}/{temp}/{scan_folder}/
-  ```
-  *Example:* `/nfs/chess/id4b/2026-2/gomez-al-4850-a/raw6M/K2Co2TeO6/KCTO-1/300/K2Co2TeO6_002/`
-- **DIALS Processed Output**:
-  ```text
-  /nfs/chess/id4baux/{cycle}/{experiment}/dials/{sample_name}/{sample_id}/{temp}/
-  ```
-  *Example:* `/nfs/chess/id4baux/2026-2/gomez-al-4850-a/dials/K2Co2TeO6/KCTO-1/300/`
-- **Beamline Calibrations**:
-  ```text
-  /nfs/chess/id4baux/{cycle}/{experiment}/calibrations/
-  ```
-  *Files:* `mask_trans.edf` (bad pixel/beamstop mask), `ceO2_15keV_trans.poni`.
-- **Final Refinement Output Folder**:
-  ```text
-  /nfs/chess/id4baux/{cycle}/{experiment}/dials/{sample_name}/{sample_id}/{temp}/for_refinement/
-  ```
+- Raw: `/nfs/chess/id4b/{cycle}/{experiment}/raw6M/{sample}/{mount}/{temp}/{scan}/`
+- Calibration: `/nfs/chess/id4baux/{cycle}/{experiment}/calibrations/`
+- Output: `/nfs/chess/id4baux/{cycle}/{experiment}/dials/{sample}/{mount}/{temp}/{scan}/`
+- Refinement bundle: `<work_dir>/for_refinement/`
 
----
+Use a new working directory for each processing choice and preserve the baseline. A pilot's threshold, resolution cutoff, cell and calibration are dataset-specific inputs, not beamline constants.
 
-## 3. Two-Stage Pipeline Architecture (100% SGE Batch Compute)
+## 3. Workflow and Working Assumptions
 
-```mermaid
-flowchart TD
-    subgraph Stage1["Stage 1: Batch Pilot Reduction (qsub on lnx307/lnx311/lnx312/lnx313)"]
-        A["Raw CBF Sweeps (*_002, *_003, *_004)"] --> B["dials.import (axes=0,-1,0 + calibrated origin)"]
-        B --> C["dials.generate_mask (pixels.mask)"]
-        C --> D["dials.find_spots (mp.nproc=24/32, threshold=5000, d_min=0.75)"]
-        D --> E["dials.index (Unconstrained Auto-Indexing)"]
-        E --> F["dials.refine_bravais_settings"]
-        F --> G["bravais_matcher.py (outputs ranked Bravais table)"]
-    end
+Raw sweep -> calibrated import/mask -> spot finding -> indexing/Bravais assessment -> geometry refinement -> integration -> symmetry/scaling -> unmerged observations and merged export -> atomic solution/refinement.
 
-    subgraph Gate["Human-in-the-Loop Checkpoint (lnx201 Inspection)"]
-        G --> H{"Inspect dials_stage1.log: Confirm Setting & cb_op"}
-    end
+Start with a plausible lattice and the simplest stable geometry/scaling model. Proceed with a documented working structure; unresolved mechanism or exact symmetry does not prevent a useful refinement. Add complexity when residuals or structural interpretation warrant it. The [decision guide](references/refinement_decisions.md) explains how to choose and test assumptions without turning every uncertainty into a stop condition.
 
-    subgraph Stage2["Stage 2: Distributed Batch Integration (qsub on lnx311/lnx312/lnx313)"]
-        H -->|Approved| I["dials.reindex (change_of_basis_op, e.g. b,c,a)"]
-        I --> J["dials.refine (scan_varying=False, fix=cell)"]
-        J --> K["dials.integrate (24/32 parallel CPU cores)"]
-        K --> L["dials.symmetry"]
-        L --> M["dials.scale (anomalous=True, absorption_level=high)"]
-        M --> N["dials.export (Unmerged SHELX for Jana2020)"]
-        M --> O["dials.merge -> dials.export (Merged SHELX for Olex2)"]
-    end
-```
+## 4. Execution
 
----
+### 4.1 Stage 1: Import, Index and Assess the Lattice
 
-## 4. Execution Workflow
-
-### 4.1 Stage 1: Batch Pilot Import, Spotfinding, Indexing, and Bravais Evaluation
-
-Submit Stage 1 as an SGE batch job from `lnx201` targeting compute nodes:
+Run inside the allocated compute job:
 
 ```bash
-qsub -q 'all.q@lnx307*,all.q@lnx311*,all.q@lnx312*,all.q@lnx313*' \
-     -l mem_free=64G -pe sge_pe 24 \
-     example_job_scripts/dials-stage1-template.sh \
-     "/nfs/chess/id4baux/{cycle}/{experiment}/dials/{sample}/{sample_id}/{temp}" \
-     "/nfs/chess/id4b/{cycle}/{experiment}/raw6M/{sample}/{sample_id}/{temp}/scan_002" \
-     "/nfs/chess/id4baux/{cycle}/{experiment}/calibrations/ceO2_15keV_trans.poni" \
-     "/nfs/chess/id4baux/{cycle}/{experiment}/calibrations/mask_trans.edf" \
-     "a,b,c,alpha,beta,gamma" \
-     "<SpaceGroup>"
+python3 scripts/orchestrate_dials.py stage1 \
+    --work-dir /path/to/new/sweep1 \
+    --raw-dir /path/to/raw/sweep1 \
+    --poni-file /path/to/zero_rotation_calibration.poni \
+    --edf-mask /path/to/mask.edf \
+    --goniometer-axes=0,-1,0 \
+    --unit-cell 'a,b,c,alpha,beta,gamma' \
+    --space-group 'P 63 2 2' --nproc 24
 ```
 
-#### Under the Hood on the Allocated Compute Node:
-1. **Calibrated Import**:
-   Imports raw frames while overriding the stale detector origin with the true beam center from the PONI file:
-   ```bash
-   dials.import path_to_scan/*.cbf \
-       geometry.detector.panel.origin="-208.324,205.764,-499.430" \
-       geometry.goniometer.axes=0,-1,0
-   ```
-2. **Detector Masking**:
-   Generates `pixels.mask` using detector module gap geometry and merges with the beamline `mask_trans.edf` mask:
-   ```bash
-   dials.generate_mask imported.expt output.mask=pixels.mask
-   ```
-3. **Multi-Threaded Spot Finding**:
-   Finds diffraction peak centroids using beamline-calibrated thresholding across 24 parallel cores:
-   ```bash
-   dials.find_spots find_spots.phil imported.expt mask=pixels.mask spotfinder.filter.d_min=0.75 mp.nproc=24
-   ```
-4. **Auto-Indexing & Symmetry Constraints**:
-   - **For Reciprocal Space Orientation Solving (`ormatrix_auto.nxs` for streaming / Huber cradle)**:
-     > [!IMPORTANT]
-     > **Always Enforce Target Space Group & Unit Cell!**
-     > Running unconstrained `dials.index` defaults to primitive $P1$, which can arbitrarily permute axes (e.g. assigning the hexagonal $c$-axis to $a$, and setting $\alpha=60^\circ$ instead of $\gamma=120^\circ$). When prior lattice info is known, explicitly constrain indexing:
-     > ```bash
-     > dials.index imported.expt strong.refl space_group="{space_group}" unit_cell="{a},{b},{c},{alpha},{beta},{gamma}"
-     > ```
-     > If the space group is uncertain, run `dials.refine_bravais_settings`, select the matching Bravais solution (`bravais_setting_*.expt`), and use that reindexed model for `dials_to_orm.py`. **Never feed unrefined $P1$ models to `dials_to_orm.py`.**
-   - **For Unknown Supercell / Modulated Structure Exploration**:
-     Run unconstrained auto-indexing to avoid rejecting superlattice reflections:
-     ```bash
-     dials.index imported.expt strong.refl
-     ```
-5. **Bravais Setting Scoring & Reindexing**:
-   Executes `dials.refine_bravais_settings indexed.expt indexed.refl`, then runs `bravais_matcher.py` to rank candidate Bravais settings. Reindexing (`dials.reindex`) ensures standard crystallographic axis convention.
+Replace symbolic cell values with six numbers. Use `--geometry-phil` instead of `--poni-file` when rotations or a different panel convention are required. Missing explicitly requested inputs are errors.
 
----
+The wrapper generates/combines detector masks, finds spots, indexes and runs `dials.refine_bravais_settings`. Its historical spot-finding defaults (`--global-threshold 5000`, `--d-min 0.75`) are pilot settings: lower the threshold or expand resolution when weak/superlattice reflections are part of the task. A high-threshold spot list cannot establish the absence of weak scattering.
 
-### 4.2 Human-in-the-Loop Checkpoint: Bravais Selection Gate
-Inspect `dials_stage1.log` from `lnx201` and present the evaluated Bravais table to the user:
-```text
-Sol  Fit      RMSD   CC           Lattice  Unit Cell                                  cb_op           Score 
----------------------------------------------------------------------------------------------------------------
- 12  0.2327   0.378  0.033/0.125  hP       62.53  62.53  12.61  90.0  90.0 120.0       b,c,a           0.055 
- 11  0.2327   0.373  0.116/0.899  oC       62.51 108.33  12.61  90.0  90.0  90.0       b,b+2*c,a       ...
-```
-* **Required Confirmation**:
-  1. Setting number (e.g. `12`).
-  2. Change of basis operator (`cb_op`, e.g. `b,c,a`). When DIALS indexes with $a$ along the hexagonal $c$-axis, `cb_op = b,c,a` permutes the axes back into the standard hexagonal setting ($a=b=62.53\text{ \AA}, c=12.61\text{ \AA}$).
+Indexing is unconstrained by default. `--constrain-symmetry` requires both cell and space group and is appropriate for a reliable known lattice. Reference cell/space group otherwise guide Bravais ranking only. The matcher accepts a space-group symbol through `--target-space-group` or a Bravais label such as `hP` through `--target-lattice`. It compares axis permutations as a reference-matching heuristic, preserving DIALS' actual change-of-basis operator. A matching metric does not determine intensity symmetry or the atomic space group.
 
----
+### 4.2 Review the Bravais Setting
 
-### 4.3 Stage 2: Batch Integration, Scaling, and Dual Export
-Submit the Stage 2 batch job to Sun Grid Engine (`qsub`):
+Inspect candidate metric fit, centroid residuals, indexed fraction and consistency with the intended lattice. Present the proposed setting and its DIALS `cb_op` for confirmation before Stage 2. Respect any existing authorization for that exact choice. A reference-match ranking does not override poor fits or extra lattices.
+
+### 4.3 Stage 2: Integrate, Scale and Export
+
+A stable first-pass example:
 
 ```bash
-qsub -q 'all.q@lnx307*,all.q@lnx311*,all.q@lnx312*,all.q@lnx313*' \
-     -l mem_free=120G -pe sge_pe 24 \
-     example_job_scripts/dials-stage2-template.sh \
-     "/nfs/chess/id4baux/{cycle}/{experiment}/dials/{sample}/{sample_id}/{temp}" \
-     "12" \
-     "b,c,a" \
-     "K2Co2TeO6"
+python3 scripts/orchestrate_dials.py stage2 \
+    --work-dir /path/to/sweep1 \
+    --bravais-setting 12 --cb-op b,c,a \
+    --scan-varying False --fix-cell \
+    --scaling-model physical --absorption-level medium \
+    --composition 'K Co Te O' --nproc 24
 ```
 
-#### Under the Hood on the Allocated Compute Node:
-1. **Reindexing to Standard Setting**:
-   ```bash
-   dials.reindex indexed.refl change_of_basis_op=b,c,a output.reflections=reindexed.refl
-   ```
-2. **Static Refinement (Fixed Unit Cell)**:
-   > [!IMPORTANT]
-   > Always specify `scan_varying=False` and `refinement.parameterisation.crystal.fix=cell` before integration. Unconstrained scan-varying refinement causes unit cell parameter drift and artificial mosaicity inflation.
-   ```bash
-   dials.refine bravais_setting_12.expt reindexed.refl \
-       scan_varying=False \
-       refinement.parameterisation.crystal.fix=cell
-   ```
-3. **Multi-Threaded 3D Profile Integration**:
-   ```bash
-   dials.integrate refined.expt refined.refl nproc=24
-   ```
-4. **Symmetry Determination & Anisotropic Absorption Caveat**:
-   ```bash
-   dials.symmetry integrated.expt integrated.refl
-   ```
-   > [!WARNING]
-   > **Beware of False Symmetry Breaking from Anisotropic Absorption / Crystal Morphology!**
-   > - `dials.symmetry` evaluates Laue group correlation coefficients on **unscaled, uncorrected raw intensities** *before* any absorption surface or angle-dependent scale model is applied.
-   > - In crystals with anisotropic shapes (e.g. flat plates, needles) and significant absorption (transition metals, heavy elements), reflections related by high-order rotation axes (3-fold, 4-fold, 6-fold) are measured at spindle angles separated by $90^\circ$ or $120^\circ$. Differential path lengths cause severe intensity discrepancies, falsely cratering raw correlation coefficients down to $\text{CC} < 0.25$.
-   > - Consequently, `dials.symmetry` may reject the true high-symmetry Laue group (e.g. hexagonal $P6/mmm$) and settle on an orthorhombic or monoclinic subgroup (e.g. $Cmmm$ / $C222$).
-   > - **Actionable Rule**: Whenever the metric unit cell is pseudo-hexagonal ($b_{\text{ortho}} \approx \sqrt{3}a_{\text{ortho}}$) or pseudo-tetragonal, **never blindly accept the lower-symmetry assignment without testing high-symmetry scaling**. Reindex to the candidate high-symmetry space group (`dials.reindex ... space_group=<HighSym>`) and run `dials.scale` with `physical.absorption_level=high`. If the data scales cleanly with comparable $R_{\text{merge}}$ and high $\text{CC}_{1/2}$, the apparent symmetry breaking was an absorption artifact. Generate refinement bundles for both space groups.
-5. **Multi-Sweep Joint Alignment & Scaling**:
-   - For multi-sweep datasets, resolve indexing ambiguities across all sweeps into a consistent setting using `dials.cosym`:
-     ```bash
-     dials.cosym sweep1/integrated.expt sweep1/integrated.refl \
-                 sweep2/integrated.expt sweep2/integrated.refl \
-                 sweep3/integrated.expt sweep3/integrated.refl \
-                 space_group=P6322
-     ```
-   - Scale all sweeps together with high-level physical absorption correction:
-     ```bash
-     dials.scale symmetrized.expt symmetrized.refl \
-         overwrite_existing_models=True \
-         absorption_level=high \
-         anomalous=True
-     ```
+Choose the setting and chemistry for the actual sample. The default fixed-cell/static fit is a conservative starting choice, **not a universal requirement**. `--no-fix-cell` allows cell refinement; `--scan-varying True` or `Auto` allows crystal scan variation. A cell kept constant through a scan (`unit_cell.force_static=True` in DIALS) can still be refined and is different from `crystal.fix=cell`. The wrapper is not a detector-motion/window-integration implementation; use a validated specialized workflow when residuals demonstrate that need.
 
-6. **Dual SHELX Refinement Bundle Generation (Hexagonal & Orthorhombic)**:
-   - **Hexagonal Unmerged SHELX (Jana2020)**:
-     ```bash
-     dials.export scaled.expt scaled.refl \
-         format=shelx \
-         composition=K2Co2TeO6 \
-         shelx.scale=False
-     mv dials.hkl for_refinement/hex_unmerged.hkl
-     mv dials.ins for_refinement/hex_unmerged.ins
-     ```
-   - **Hexagonal Merged SHELX (Olex2 / SHELXL)**:
-     > [!NOTE]
-     > `dials.merge` writes an MTZ file (`merged.mtz`). Convert it to SHELX `.hkl` using `iotbx.reflection_file_converter`:
-     ```bash
-     dials.merge scaled.expt scaled.refl output.html=None output.mtz=merged.mtz
-     iotbx.reflection_file_converter merged.mtz --shelx=for_refinement/hex_merged.hkl --label="IMEAN,SIGIMEAN"
-     cp for_refinement/hex_unmerged.ins for_refinement/hex_merged.ins
-     ```
-   - **Orthohexagonal C-Centered Export**:
-     > [!IMPORTANT]
-     > Direct `dials.reindex` with an orthohexagonal operator (`a,a+2*b,c`) on a $P6_322$ dataset fails with `Unsuitable value for rational rotation matrix` because 6-fold / 3-fold symmetry operators cannot exist on an orthorhombic lattice.
-     > To export in the orthohexagonal setting ($a, b=\sqrt{3}a, c$):
-     > 1. Set the crystal space group to the orthorhombic subgroup ($C222$), and unit cell to $(a, \sqrt{3}a, c, 90^\circ, 90^\circ, 90^\circ)$.
-     > 2. Transform Miller indices in the reflection table: $h_O = h$, $k_O = h + 2k$, $l_O = l$.
-     > 3. Export unmerged reflections via `dials.export` (`for_refinement/unmerged.hkl`).
-     > 4. Merge under $C222$ via `dials.merge` and convert MTZ to `for_refinement/merged.hkl`.
+Scaling choices:
 
----
+- `--scaling-model scale-only`: one KB scale per input dataset, no KB decay term.
+- `--scaling-model physical --absorption-level none|low|medium|high`: choose absorption flexibility according to data and correction magnitude. Medium is the wrapper default; high is an explicit stronger correction, not an automatic improvement.
+- Default symmetry handling calls `dials.symmetry`. `--keep-input-symmetry` preserves the selected model; `--space-group 'P 1'` explicitly resets scaling symmetry for a lower-symmetry comparison. These alternatives are mutually exclusive.
+- `--anomalous True` keeps Bijvoet distinctions during scaling. It does not make a Friedel-averaged merged export anomalous.
 
-## 5. Troubleshooting & Lessons Learned
+Testing high-symmetry scaling when raw correlations look poor is reasonable. A clean result supports a **working high-symmetry average structure**; it does not prove that lower-symmetry intensity differences were instrumental. For sequential lower-symmetry tests, keep unmerged original indices and use the same minimally assumed scaling symmetry, corrections, observations and weights. Compare structural improvements against parameter cost, physicality and prediction; see the [decision guide](references/refinement_decisions.md).
 
-| Issue / Failure | Root Cause | Solution |
-| :--- | :--- | :--- |
-| **Running data processing on `lnx201`** | Attempting interactive execution on login node violates cluster etiquette and beamline policy. | **Strictly prohibited**. All processing (Stage 1 and Stage 2) must be submitted via SGE batch (`qsub`) or executed inside an allocated `qrsh` worker session. |
-| **`MemoryError` during `dials.integrate`** (180 GB memory for shoeboxes) | Uncalibrated beam center in CBF headers ($126\text{ mm}$ offset) or drifting unit cell inflating mosaicity $\sigma_m > 2.5^\circ$. | 1. Pass `geometry.detector.panel.origin` from pyFAI PONI.<br>2. Run `dials.refine` with `scan_varying=False` and `fix=cell`. |
-| **`No suitable lattice could be found` during `dials.index`** | Passing `indexing.known_symmetry.unit_cell` when crystal possesses supercell reflections ($62.5\text{ \AA}$ vs $5.22\text{ \AA}$) or non-standard orientation. | Run unconstrained auto-indexing first (`dials.index imported.expt strong.refl`). Let DIALS find the true lattice naturally. |
-| **Multi-sweep indexing fails (0 spots indexed) on sweeps 2 or 3** | Default goniometer axis `axes=0,-1,0` used for tilted sweeps. Off-axis tilts ($\Delta\chi = 7^\circ, \Delta\theta = 3^\circ$) introduce severe angular error. | Extract Eulerian motor positions ($\theta, \chi, \phi$) from SPEC file and calculate calibrated spindle vector $\vec{u}_{\text{DIALS}}$ for each sweep during `dials.import`. |
-| **`Unsuitable value for rational rotation matrix` during `dials.reindex`** | Attempting a basis change from hexagonal to orthorhombic without reducing space group symmetry. | Convert the crystal space group to an orthorhombic subgroup ($C222$), update the cell to $(a, \sqrt{3}a, c)$, and transform Miller indices ($h, h+2k, l$). |
-| **Refinement fails or yields huge RMSD after Bravais selection** | Candidate Bravais setting required an axis permutation (`cb_op != a,b,c`), but reflections were not reindexed. | Run `dials.reindex indexed.refl change_of_basis_op=<cb_op>` before running `dials.refine`. |
-| **False lower symmetry selection in `dials.symmetry` (e.g., $C222$ instead of $P6_322$)** | `dials.symmetry` runs on **unscaled raw intensities**. Anisotropic crystal shape (e.g., flat plates) causes severe angle-dependent path length differences across $120^\circ$ rotation, cratering raw correlation coefficients ($\text{CC} \approx 0.22$). | If the metric lattice is pseudo-hexagonal ($b \approx \sqrt{3}a$), test scaling directly in the high-symmetry group: `dials.reindex ... space_group="P6322"` followed by `dials.scale` with `physical.absorption_level=high`. If $R_{\text{merge}}$ is comparable and $R_{\text{pim}}$ is strong ($\le 3-4\%$), export both high- and low-symmetry bundles to `for_refinement/`. |
-| **`dials.merge` does not create `.refl` file** | `dials.merge` outputs MTZ format by design (`merged.mtz`). | Convert MTZ to SHELX `.hkl` via `iotbx.reflection_file_converter merged.mtz --shelx=merged.hkl --label="IMEAN,SIGIMEAN"`. |
+The corrected export path is:
 
----
+```bash
+dials.export scaled.expt scaled.refl format=shelx intensity=scale mtz.min_isigi=None \
+    shelx.composition='K Co Te O' shelx.scale=False \
+    shelx.hklout=for_refinement/unmerged.hkl \
+    shelx.ins=for_refinement/unmerged.ins
+dials.merge scaled.expt scaled.refl output.html=None output.mtz=for_refinement/merged.mtz assess_space_group=False truncate=False
+iotbx.reflection_file_converter for_refinement/merged.mtz \
+    --shelx=for_refinement/merged.hkl --label=IMEAN,SIGIMEAN
+cp for_refinement/unmerged.ins for_refinement/merged.ins
+```
 
-## 6. Handoff to Refinement Programs
+`dials.merge` writes MTZ, not `.expt`/`.refl`. `merged.hkl` contains mean intensities averaged over Friedel pairs; keep the unmerged bundle and MTZ for anomalous or alternate-symmetry work. Merging in a higher group loses differences that later lowering the atomic symmetry cannot recover.
 
-For full GUI import instructions, refer to [`references/jana_olex_import_guide.md`](references/jana_olex_import_guide.md).
+**Composition and numerical precision:** DIALS `shelx.composition` means asymmetric-unit contents, not necessarily the bulk chemical formula. An element list writes placeholder UNIT counts; verify UNIT, ZERR/Z, occupancy and special-position multiplicities before refinement. `--shelx-scale True` enables DIALS' intensity-field rescaling where supported; audit weak/negative intensities and sigmas for rounding or overflow under either choice. The multiplicative output scale must apply equally to I and sigma(I).
 
-- **Jana2020**: Open **New Structure**, select **SHELX format**, and load `for_refinement/unmerged.ins` (which pairs with `unmerged.hkl`). Configure modulation vectors $\mathbf{q}$, absorption models, or twin matrices directly in Jana.
-- **Olex2 / SHELXL**: Open `for_refinement/merged.ins` in Olex2, solve using SHELXT, and refine using SHELXL.
+### 4.4 Multiple Sweeps
+
+Import and integrate each tilted sweep with its own validated geometry. Resolve indexing ambiguity before combining intensities, for example:
+
+```bash
+dials.cosym sweep1/integrated.expt sweep1/integrated.refl \
+    sweep2/integrated.expt sweep2/integrated.refl \
+    sweep3/integrated.expt sweep3/integrated.refl \
+    space_group='P 63 2 2'
+dials.scale symmetrized.expt symmetrized.refl \
+    model=physical absorption_level=medium anomalous=True
+```
+
+Use the justified common group for the task, not the example group blindly. Check shared-reflection agreement across geometries, unit-cell compatibility and scaling connectivity. The wrapper itself does not execute this multi-sweep alignment stage.
+
+### 4.5 Batch Templates and Local Verification
+
+The three scripts under `example_job_scripts/` remain CLASSE SGE wrappers. Set `DIALS_ENV` and `SKILLS_DIR` for your installation. Extra CLI arguments may be passed after the documented positional arguments. Show the concrete job and obey the repository's submission authorization rules; do not submit compute as part of a source-code review.
+
+Run regression tests from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -v
+# Also run with the installed DIALS interpreter for cctbx/interface checks:
+dials.python -m unittest discover -s tests -v
+```
+
+Tests exercise command construction and small synthetic data; they do not establish scientific accuracy for a new beamline dataset.
+
+## 5. Refinement Handoff
+
+Both Jana2020 and Olex2/SHELXL can use appropriate unmerged data. The merged bundle is a convenience for an adopted average structure, not a requirement of SHELXL. HKLF 4 alone does not carry measurement geometry for a fresh analytical absorption correction or satellite indices for general superspace refinement. Retain original experiment/reflection files and appropriate richer exports for those tasks.
+
+Follow the [import guide](references/jana_olex_import_guide.md), then refine the atomic model with wavelength-specific scattering corrections, sensible displacement parameters, controlled occupancy/extinction choices and residual-density review. Use stronger comparisons when choosing between models; routine validation should help obtain a usable refinement rather than postpone it indefinitely.

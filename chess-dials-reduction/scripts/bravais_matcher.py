@@ -7,50 +7,121 @@ Author: Steven Gomez-Alvarado / CHESS Data Reduction Skills
 """
 
 import argparse
+import itertools
 import json
+import math
 import os
 import re
 import sys
 
 
+BRAVAIS_LATTICES = ("aP", "mP", "mC", "oP", "oC", "oF", "oI",
+                    "tP", "tI", "hP", "hR", "cP", "cI", "cF")
+
+
+def _optional_float(value):
+    """Missing diagnostics stay missing instead of becoming perfect zero fits."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def validate_cell(cell):
+    if len(cell) != 6:
+        raise ValueError("A unit cell needs a,b,c,alpha,beta,gamma")
+    cell = tuple(float(value) for value in cell)
+    if not all(math.isfinite(value) for value in cell):
+        raise ValueError("Unit-cell parameters must be finite")
+    if any(value <= 0 for value in cell[:3]):
+        raise ValueError("Unit-cell lengths must be positive")
+    if any(not 0 < angle < 180 for angle in cell[3:]):
+        raise ValueError("Unit-cell angles must lie between 0 and 180 degrees")
+    ca, cb, cg = (math.cos(math.radians(angle)) for angle in cell[3:])
+    determinant = 1 - ca * ca - cb * cb - cg * cg + 2 * ca * cb * cg
+    if determinant <= 0:
+        raise ValueError("Unit-cell metric must have positive volume")
+    return cell
+
+
+def _cell_volume(cell):
+    a, b, c, alpha, beta, gamma = validate_cell(cell)
+    ca, cb, cg = (math.cos(math.radians(angle)) for angle in (alpha, beta, gamma))
+    return a * b * c * math.sqrt(1 - ca * ca - cb * cb - cg * cg + 2 * ca * cb * cg)
+
+
+def normalize_lattice(symbol):
+    lookup = {lattice.lower(): lattice for lattice in BRAVAIS_LATTICES}
+    try:
+        return lookup[symbol.strip().lower()]
+    except (AttributeError, KeyError):
+        raise ValueError("Expected a Bravais symbol such as hP or cP; "
+                         "use --target-space-group for a space-group symbol") from None
+
+
+def lattice_from_space_group(symbol):
+    """Resolve the standard Bravais type, including nonstandard SG settings."""
+    try:
+        from cctbx import sgtbx
+        from cctbx.sgtbx import bravais_types
+    except ImportError as exc:
+        raise RuntimeError("--target-space-group requires cctbx; run with dials.python") from exc
+    try:
+        info = sgtbx.space_group_info(symbol=symbol)
+        reference = info.change_basis(info.type().cb_op())
+        return normalize_lattice(str(bravais_types.bravais_lattice(group=reference.group())))
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(f"Invalid space group {symbol!r}: {exc}") from exc
+
+
 def parse_bravais_log(log_path):
-    """Parse the Bravais settings table from bravais_summary.json or log file."""
-    # Check if a sibling bravais_summary.json exists
+    """Prefer structured DIALS output; retain usable rows if one row is malformed."""
     json_path = os.path.join(os.path.dirname(log_path) or ".", "bravais_summary.json")
     if os.path.exists(json_path):
         try:
             with open(json_path, "r") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Bravais summary must be a mapping of setting IDs")
+        except (OSError, ValueError) as exc:
+            print(f"Warning: cannot read {json_path}: {exc}; trying the log", file=sys.stderr)
+        else:
             solutions = []
-            for sol_key, v in data.items():
-                sol_id = int(sol_key)
-                uc = v["unit_cell"]
-                # Calculate volume
-                a, b, c, al, be, ga = uc
-                import math
-                al_r, be_r, ga_r = math.radians(al), math.radians(be), math.radians(ga)
-                vol = a * b * c * math.sqrt(
-                    1 - math.cos(al_r)**2 - math.cos(be_r)**2 - math.cos(ga_r)**2 +
-                    2 * math.cos(al_r) * math.cos(be_r) * math.cos(ga_r)
-                )
-                cc_str = f"{v.get('min_cc', 0.0):.3f}/{v.get('max_cc', 0.0):.3f}" if v.get('min_cc') is not None else "-/-"
-                solutions.append({
-                    "solution": sol_id,
-                    "recommended": v.get("recommended", False),
-                    "metric_fit": v.get("max_angular_difference", 0.0),
-                    "rmsd": v.get("rmsd", 0.0),
-                    "cc": cc_str,
-                    "spots": v.get("nspots", 0),
-                    "lattice": v.get("bravais", ""),
-                    "cell": uc,
-                    "volume": vol,
-                    "cb_op": v.get("cb_op", "a,b,c"),
-                    "file": f"bravais_setting_{sol_id}.expt"
-                })
-            solutions.sort(key=lambda s: s["solution"], reverse=True)
-            return solutions
-        except Exception:
-            pass
+            for sol_key, record in data.items():
+                try:
+                    sol_id = int(sol_key)
+                    if sol_id <= 0 or not isinstance(record, dict):
+                        raise ValueError("Expected a positive setting ID and record")
+                    cell = validate_cell(record["unit_cell"])
+                    lattice = normalize_lattice(record["bravais"])
+                    cb_op = record.get("cb_op")
+                    if not isinstance(cb_op, str) or not cb_op.strip():
+                        raise ValueError("Missing DIALS change-of-basis operator")
+                    min_cc = _optional_float(record.get("min_cc"))
+                    max_cc = _optional_float(record.get("max_cc"))
+                    cc = "/".join("-" if value is None else f"{value:.3f}"
+                                  for value in (min_cc, max_cc))
+                    spots = _optional_float(record.get("nspots"))
+                    solutions.append({
+                        "solution": sol_id,
+                        "recommended": record.get("recommended") is True,
+                        "metric_fit": _optional_float(record.get("max_angular_difference")),
+                        "rmsd": _optional_float(record.get("rmsd")),
+                        "cc": cc,
+                        "spots": int(spots) if spots is not None else None,
+                        "lattice": lattice,
+                        "cell": list(cell),
+                        "volume": _cell_volume(cell),
+                        "cb_op": cb_op,
+                        "file": f"bravais_setting_{sol_id}.expt",
+                    })
+                except (KeyError, TypeError, ValueError) as exc:
+                    print(f"Warning: skipping invalid Bravais setting {sol_key!r}: {exc}",
+                          file=sys.stderr)
+            if solutions:
+                return sorted(solutions, key=lambda row: row["solution"], reverse=True)
+            print(f"Warning: no usable settings in {json_path}; trying the log", file=sys.stderr)
 
     if not os.path.exists(log_path):
         raise FileNotFoundError(f"Log file not found: {log_path}")
@@ -100,103 +171,126 @@ def parse_bravais_log(log_path):
     return solutions
 
 
+def compare_cells(sol_cell, target_cell):
+    """Return the best metric score and axis permutation, for comparison only.
+
+    A permutation remaps the three interaxial angles along with the lengths.
+    It is not a reindexing operator and never replaces DIALS' cb_op. Signed
+    basis changes, conventional-cell conversions and supercells are not searched.
+    """
+    solution = validate_cell(sol_cell)
+    target = validate_cell(target_cell)
+    angle_for_pair = {(1, 2): solution[3], (0, 2): solution[4], (0, 1): solution[5]}
+    candidates = []
+    for axes in itertools.permutations(range(3)):
+        lengths = tuple(solution[index] for index in axes)
+        angles = tuple(angle_for_pair[tuple(sorted((axes[i], axes[j])))]
+                       for i, j in ((1, 2), (0, 2), (0, 1)))
+        score = sum(abs(actual - expected) / expected
+                    for actual, expected in zip(lengths, target[:3]))
+        score += sum(abs(actual - expected) / 90.0
+                     for actual, expected in zip(angles, target[3:]))
+        candidates.append((score, axes))
+    return min(candidates)
+
+
 def score_cell_match(sol_cell, target_cell):
-    """
-    Compute a normalized error score between solution cell and target cell.
-    Considers standard axis permutations if lengths are close.
-    """
-    sol_a, sol_b, sol_c, sol_al, sol_be, sol_ga = sol_cell
-    tgt_a, tgt_b, tgt_c, tgt_al, tgt_be, tgt_ga = target_cell
-
-    # Length relative differences
-    d_len = (abs(sol_a - tgt_a) / tgt_a +
-             abs(sol_b - tgt_b) / tgt_b +
-             abs(sol_c - tgt_c) / tgt_c)
-
-    # Angle absolute differences in degrees (normalized by 90)
-    d_ang = (abs(sol_al - tgt_al) +
-             abs(sol_be - tgt_be) +
-             abs(sol_ga - tgt_ga)) / 90.0
-
-    return d_len + d_ang
+    """Normalized reference-cell mismatch after an exact axis permutation."""
+    return compare_cells(sol_cell, target_cell)[0]
 
 
 def match_bravais_settings(solutions, target_cell=None, target_lattice=None):
-    """Rank solutions against target cell and lattice."""
+    """Order reference matches; this heuristic does not determine symmetry."""
+    if target_lattice is not None:
+        target_lattice = normalize_lattice(target_lattice)
     ranked = []
-    for sol in solutions:
-        score = 0.0
+    for original in solutions:
+        sol = dict(original)
+        score, axes = (0.0, (0, 1, 2))
         if target_cell is not None:
-            score += score_cell_match(sol["cell"], target_cell)
-        if target_lattice is not None:
-            if sol["lattice"].lower() != target_lattice.lower():
-                score += 5.0  # heavy penalty for lattice mismatch
+            score, axes = compare_cells(sol["cell"], target_cell)
+        sol["comparison_axes"] = ",".join("abc"[index] for index in axes)
+        sol["lattice_match"] = (None if target_lattice is None else
+                                sol["lattice"].lower() == target_lattice.lower())
+        if sol["lattice_match"] is False:
+            score += 5.0
         ranked.append((score, sol))
 
-    ranked.sort(key=lambda x: (x[0], x[1]["metric_fit"]))
+    def diagnostic(value):
+        return float("inf") if value is None else value
+
+    ranked.sort(key=lambda item: (item[0], not item[1]["recommended"],
+                                 diagnostic(item[1]["metric_fit"]),
+                                 diagnostic(item[1]["rmsd"])))
     return ranked
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Match DIALS Bravais settings to target unit cell.")
+    parser = argparse.ArgumentParser(description="Compare DIALS Bravais settings with a reference cell.")
     parser.add_argument("--log", default="dials.refine_bravais_settings.log", help="Path to Bravais log file")
-    parser.add_argument("--target-cell", help="Target cell as a,b,c,alpha,beta,gamma")
-    parser.add_argument("--target-lattice", help="Target Bravais lattice (e.g. hP, hR, oP, mP, tP)")
+    parser.add_argument("--target-cell", help="Reference cell as a,b,c,alpha,beta,gamma")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--target-lattice", help="Bravais symbol (e.g. hP, hR, oP, mP, tP)")
+    target.add_argument("--target-space-group", help="Reference space group (e.g. P6322); requires dials.python")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
-
     args = parser.parse_args()
 
-    target_cell = None
-    if args.target_cell:
-        target_cell = [float(x.strip()) for x in args.target_cell.split(",")]
-        if len(target_cell) != 6:
-            raise ValueError("Target cell must have 6 parameters: a,b,c,alpha,beta,gamma")
-
-    solutions = parse_bravais_log(args.log)
+    try:
+        target_cell = (validate_cell(re.split(r"[\s,]+", args.target_cell.strip()))
+                       if args.target_cell else None)
+        target_lattice = (lattice_from_space_group(args.target_space_group)
+                          if args.target_space_group else
+                          normalize_lattice(args.target_lattice) if args.target_lattice else None)
+        solutions = parse_bravais_log(args.log)
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
     if not solutions:
-        print("No Bravais solutions parsed from log file.", file=sys.stderr)
-        sys.exit(1)
+        parser.error("No Bravais solutions parsed from log file")
 
-    ranked = match_bravais_settings(solutions, target_cell, args.target_lattice)
-
+    ranked = match_bravais_settings(solutions, target_cell, target_lattice)
+    has_reference = target_cell is not None or target_lattice is not None
+    best = ranked[0][1] if has_reference else None
+    interpretation = ("Reference mismatch is a heuristic, not a symmetry score. Review DIALS "
+                      "recommendation (*), RMSD, metric fit and intensity evidence before selection. "
+                      "Comparison axes do not modify the DIALS change-of-basis operator.")
     if args.json:
         out = {
-            "solutions": solutions,
-            "best_match": ranked[0][1] if ranked else None,
-            "best_score": ranked[0][0] if ranked else None
+            "solutions": [solution for _, solution in ranked],
+            "best_match": best,
+            "best_score": ranked[0][0] if has_reference else None,
+            "target_lattice": target_lattice,
+            "interpretation": interpretation,
         }
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out, indent=2, allow_nan=False))
         return
 
-    print("=== DIALS Bravais Settings Evaluation ===")
-    print(f"Total candidate solutions parsed: {len(solutions)}")
+    print("=== DIALS Bravais Reference Comparison ===")
+    print(f"Total candidate solutions: {len(solutions)}")
     if target_cell:
-        print(f"Target Unit Cell: {target_cell}")
-    if args.target_lattice:
-        print(f"Target Lattice: {args.target_lattice}")
+        print(f"Reference Unit Cell: {target_cell}")
+    if target_lattice:
+        print(f"Reference Bravais Lattice: {target_lattice}")
+    print(interpretation)
     print()
-
-    print(f"{'Sol':<4} {'Fit':<8} {'RMSD':<6} {'CC':<12} {'Lattice':<8} {'Unit Cell':<42} {'cb_op':<15} {'Score':<6}")
-    print("-" * 95)
+    print(f"{'Sol':<4} {'Fit':<8} {'RMSD':<6} {'CC':<12} {'Lattice':<8} {'Unit Cell':<42} "
+          f"{'cb_op':<15} {'Compare axes':<13} {'Mismatch':<8}")
+    print("-" * 122)
     for score, sol in ranked:
         c = sol["cell"]
         cell_str = f"{c[0]:.2f} {c[1]:.2f} {c[2]:.2f} {c[3]:.1f} {c[4]:.1f} {c[5]:.1f}"
         rec = "*" if sol["recommended"] else " "
-        print(f"{rec}{sol['solution']:<3} {sol['metric_fit']:<8.4f} {sol['rmsd']:<6.3f} {sol['cc']:<12} {sol['lattice']:<8} {cell_str:<42} {sol['cb_op']:<15} {score:<6.3f}")
-
-    best = ranked[0][1]
-    print()
-    print(f"--> RECOMMENDED SOLUTION: Setting {best['solution']} ({best['lattice']})")
-    print(f"    Cell: {best['cell']}")
-    print(f"    Change of basis: {best['cb_op']}")
-    print(f"    Experiment file: {best['file']}")
-    print()
-    print("Next commands:")
-    if best['cb_op'] != "a,b,c":
-        print(f"  dials.reindex indexed.refl change_of_basis_op={best['cb_op']}")
-        print(f"  dials.refine {best['file']} reindexed.refl")
+        fit = "-" if sol["metric_fit"] is None else f"{sol['metric_fit']:.4f}"
+        rmsd = "-" if sol["rmsd"] is None else f"{sol['rmsd']:.3f}"
+        print(f"{rec}{sol['solution']:<3} {fit:<8} {rmsd:<6} {sol['cc']:<12} "
+              f"{sol['lattice']:<8} {cell_str:<42} {sol['cb_op']:<15} "
+              f"{sol['comparison_axes']:<13} {score:<8.3f}")
+    if best:
+        print(f"\nClosest reference match: setting {best['solution']} ({best['lattice']})")
+        print(f"DIALS recommends this setting: {best['recommended']}")
+        print(f"After reviewing the diagnostics, use experiment {best['file']} "
+              f"with DIALS change_of_basis_op={best['cb_op']}.")
     else:
-        print(f"  dials.refine {best['file']} indexed.refl")
+        print("\nNo reference supplied; select from the DIALS diagnostics above.")
 
 
 if __name__ == "__main__":
