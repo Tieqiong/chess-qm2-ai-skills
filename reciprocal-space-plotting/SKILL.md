@@ -1,219 +1,102 @@
 ---
 name: reciprocal-space-plotting
 description: >-
-  Fast, recipe-driven 2D slice visualization and orthogonal multi-panel plotting
-  for 3D reciprocal space X-ray and neutron diffraction datasets (NeXus/HDF5).
-  Use when generating 2D cross-sectional slices (HK, HL, KL planes), 3-panel
-  summary figures, calibrated physical aspect ratio (b*/a*, c*/a*) projections,
-  crystallographic skew grid lines, integer tick locators, or logarithmic colormaps.
+  Generate HK, HL and KL slices or three-panel summaries from 3D NeXus reciprocal
+  volumes using native axis metadata and optional full reciprocal-metric geometry.
+  Use for diagnostic PNG figures; intensity normalization and coverage validation
+  remain pending.
 ---
 
-# 2D Reciprocal Space Plotting & Slicing Skill (`reciprocal-space-plotting`)
+# Reciprocal space slices
 
-This skill provides fast, copy-paste-ready Python recipes and operational standards for generating 2D reciprocal space cross-sections and publication-quality diagnostic figures from 3D NeXus datasets (`.nxs`, `.h5`).
+Use the shared `nxs_analysis_tools.reciprocal` API from the
+[analysis-library fork](https://github.com/Tieqiong/nxs_analysis_tools/tree/codex/reciprocal-slicing).
+The scripts require this API; they do not silently substitute older positional slicing.
+Use the updated source checkout on `PYTHONPATH` after preparing its generated
+version module, or install the fork in an environment chosen for this work.
+See [runtime setup](../docs/reciprocal-analysis-status.md#runtime-for-the-updated-scripts).
+Do not change shared cluster environments.
 
----
+## Current scope
 
-## 1. Golden Rules of Reciprocal Space Plotting
+Native coordinate resolution, lazy plane extraction, actual selected-bin labels,
+bin-edge plotting, and nonorthogonal physical geometry are implemented.
+Mask/coverage handling and automatic intensity normalization are **TO BE UPDATED**;
+see [analysis status](../docs/reciprocal-analysis-status.md). The current automatic
+logarithmic limits retain the count-oriented lower floor of 1. For normalized
+sub-unit data, provide explicit `--vmin` and `--vmax`; signed-intensity views are deferred.
 
-1. **Strictly Enforce Headless Rendering**:
-   Always set the non-interactive backend before importing `pyplot`:
-   ```python
-   import matplotlib
-   matplotlib.use("Agg")
-   import matplotlib.pyplot as plt
-   ```
-2. **Never Read Full 3D Volumes into Memory (`.nxdata` Trap)**:
-   Accessing `.nxdata` directly on an unsliced 3D dataset forces an eager read of the entire 1–25 GB volume into RAM. Always slice lazily using hyperslab indexing (`data[:, :, 0.0]`) or `h5py` dataset slicing.
-3. **Logarithmic Scaling (`LogNorm`) Requires `vmin > 0`**:
-   Zero or negative pixels (e.g. from background subtraction or unvisited detector pixels) cause `LogNorm` to fail or render black artifacts. Always set `vmin >= 1.0` (or `vmin = max(1.0, np.nanpercentile(slice_data[slice_data > 0], 5))`).
-4. **Physical Aspect Ratio Calibration is Mandatory**:
-   Synchrotron reciprocal lattice parameters frequently differ between axes ($a^* \ne c^*$). If aspect ratio is left uncalibrated, circular diffuse rings elongate into ellipses along $L$. Always scale the display aspect ratio:
-   $$A_{\text{display}} = \frac{v_Y^*}{v_X^*} \times \sin(\theta_{\text{skew}})$$
+## Coordinates and physical geometry
 
----
+- Resolve axes from `NXdata.nxaxes`: H/K/L and Qh/Qk/Ql are accepted regardless of
+  native storage order. Unknown or ambiguous mappings fail explicitly.
+- HK fixes L, HL fixes K, and KL fixes H. `--coord` always means a physical r.l.u.
+  coordinate, including integer-valued arguments. Extraction reads one plane.
+- Selection uses the bin containing the requested coordinate. The figure labels
+  its actual center and records the requested value if different. Out-of-range
+  coordinates fail instead of silently taking an edge plane.
+- `--coordinates auto` uses native `NXentry/sample/unit_cell` metadata when available,
+  or `--unit-cell` as an explicit override. Without a cell it draws a labeled r.l.u. view.
+- `--coordinates physical` requires a valid cell; `--coordinates rlu` requests
+  rectangular H/K/L coordinate axes. Missing cells are never replaced by an invented cubic cell.
 
-## 2. Dataset Format Coordinates & Plane Slicing
+Physical rendering uses the reciprocal metric including all cell angles. For an
+HK plane, its Cartesian mesh is
+`X = a* H + b* cos(gamma*) K`, `Y = b* sin(gamma*) K`, with equal display aspect.
+HL/KL use the corresponding reciprocal basis. The physical axes are plane-local
+coordinates in Å⁻¹ **without a 2π factor**, relative to the fixed-coordinate origin.
+They are not mislabeled H/K/L indices. A length-ratio aspect adjustment after a
+fixed shear is insufficient for unequal, oblique reciprocal axes.
 
-A reciprocal lattice plane is defined by **fixing the coordinate perpendicular to the plane**:
-- **$HK$ Plane**: Hold $L$ constant (free axes: $H, K$).
-- **$HL$ Plane**: Hold $K$ constant (free axes: $H, L$).
-- **$KL$ Plane**: Hold $H$ constant (free axes: $K, L$).
+## CLI examples
 
-Because NXRefine and Legacy CHESS data structures use different axis ordering conventions, slice axes differ:
+Run from this skill directory with the updated library available:
 
-| Dataset Format | Native Axes | $HK$ Slice ($L=\text{const}$) | $HL$ Slice ($K=\text{const}$) | $KL$ Slice ($H=\text{const}$) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Legacy CHESS** (`*hkli*.nxs`) | `['H', 'K', 'L']` | Axis 2: `data[:, :, l_val]` | Axis 1: `data[:, k_val, :]` | Axis 0: `data[h_val, :, :]` |
-| **NXRefine** (`use_nxlink=True`) | `['Ql', 'Qk', 'Qh']` | Axis 0: `data[l_val, :, :]` | Axis 1: `data[:, k_val, :]` | Axis 2: `data[:, :, h_val]` |
+```bash
+python scripts/plot_slice.py --nxs volume.nxs --plane HK --coord 0.0 --output slice.png
+python scripts/plot_slice.py --nxs volume.nxs --plane HL --coord 0.0 --coordinates rlu --vmin 0.01 --vmax 10 --output slice_HL.png
+python scripts/plot_summary.py --nxs volume.nxs --unit-cell "5.0027,5.0027,4.0548,90,90,120" --coordinates physical --output summary.png
+```
 
-> [!WARNING]
-> Always check `data.nxaxes` before indexing! In NXRefine, indexing Axis 2 fixes $Q_h$ (yielding the $KL$ plane, NOT the $HK$ plane).
+The summary uses shared intensity limits across its three planes. Physical
+panels preserve angles and relative lengths within each plane; independently
+laid-out panels do not promise identical pixels per Å⁻¹ across the whole figure.
 
----
-
-## 3. Recipes
-
-### Recipe 1: Quick Single 2D Slice (with Aspect Ratio & Skew)
+## Python extraction and rendering
 
 ```python
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from matplotlib.ticker import MultipleLocator
-import numpy as np
 import nexusformat.nexus as nx
-
-# 1. Open volume lazily
-nx.nxsetmemory(20000)
-root = nx.nxload("3rot_hkli_lite.nxs")
-data = root.entry.data
-
-# 2. Extract HK plane lazily at L = 0.0
-# For Legacy CHESS: axes are [H, K, L] -> slice along axis 2
-slice_nx = data[:, :, 0.0]
-counts = np.asarray(slice_nx.nxsignal.nxdata, dtype=np.float32)
-h_axis = np.asarray(slice_nx.nxaxes[0].nxdata)
-k_axis = np.asarray(slice_nx.nxaxes[1].nxdata)
-
-# 3. Setup figure
-fig, ax = plt.subplots(figsize=(6, 5), dpi=200)
-
-# 4. Aspect ratio: b* / a* (for hexagonal/tetragonal a* == b* -> 1.0)
-aspect_ratio = 1.0  # b_star / a_star
-vmin = max(1.0, float(np.nanpercentile(counts[counts > 0], 5)))
-vmax = float(np.nanpercentile(counts[counts > 0], 99.8))
-
-im = ax.imshow(
-    counts.T,
-    origin="lower",
-    extent=[h_axis[0], h_axis[-1], k_axis[0], k_axis[-1]],
-    norm=LogNorm(vmin=vmin, vmax=vmax),
-    cmap="viridis",
-    aspect=aspect_ratio,
+from nxs_analysis_tools.reciprocal import (
+    resolve_nxdata, reciprocal_slice, resolve_unit_cell, physical_mesh,
 )
 
-# 5. Crystallographic integer ticks and labels
-ax.xaxis.set_major_locator(MultipleLocator(2))
-ax.xaxis.set_minor_locator(MultipleLocator(1))
-ax.yaxis.set_major_locator(MultipleLocator(2))
-ax.yaxis.set_minor_locator(MultipleLocator(1))
-ax.tick_params(direction="in", top=True, right=True, which="both")
-
-ax.set_xlabel(r"$H$ (r.l.u.)", fontsize=11)
-ax.set_ylabel(r"$K$ (r.l.u.)", fontsize=11)
-ax.set_title(r"$(HK0)$ Reciprocal Slice", fontsize=12)
-
-cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-cbar.set_label("Intensity (counts)", fontsize=10)
-
-plt.tight_layout()
-plt.savefig("slice_HK.png", dpi=300)
+root = nx.nxload("volume.nxs")
+data = resolve_nxdata(root)
+section = reciprocal_slice(data, "HK", 0.0)
+cell = resolve_unit_cell(data)
+if cell is None:
+    raise ValueError("Supply a measured unit cell for this physical-coordinate example")
+x, y = physical_mesh(section, cell)
+fig, ax = plt.subplots()
+mesh = ax.pcolormesh(x, y, section.values, shading="flat")
+ax.set_aspect("equal")
+ax.set_xlabel("q parallel to H* (Å⁻¹)")
+ax.set_ylabel("q perpendicular to H* in HK (Å⁻¹)")
+ax.set_title(f"HK at L={section.actual_coord:g} r.l.u.")
+fig.colorbar(mesh, ax=ax, label="Intensity (input units)")
+fig.savefig("slice_physical.png")
 plt.close(fig)
 ```
 
----
+Keep headless rendering and lazy slicing. Integer locators apply to the r.l.u.
+view; physical Cartesian axes use physical-coordinate ticks, not Miller-index labels.
 
-### Recipe 2: Standard 3-Panel Orthogonal Summary Plot ($HK, HL, KL$)
+## Related work
 
-```python
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from matplotlib.ticker import MultipleLocator
-import numpy as np
-import nexusformat.nexus as nx
-
-def generate_3panel_summary(nxs_path, out_png, h_val=0.0, k_val=0.0, l_val=0.0,
-                             a_star=0.2304, b_star=0.2304, c_star=0.2467):
-    """
-    Generate side-by-side 3-panel figure for HK, HL, and KL planes.
-    """
-    nx.nxsetmemory(20000)
-    root = nx.nxload(nxs_path)
-    data = root.entry.data
-
-    # Extract 2D hyperslabs lazily
-    slice_hk = data[:, :, l_val]
-    slice_hl = data[:, k_val, :]
-    slice_kl = data[h_val, :, :]
-
-    img_hk = np.asarray(slice_hk.nxsignal.nxdata, dtype=np.float32)
-    img_hl = np.asarray(slice_hl.nxsignal.nxdata, dtype=np.float32)
-    img_kl = np.asarray(slice_kl.nxsignal.nxdata, dtype=np.float32)
-
-    h = np.asarray(slice_hk.nxaxes[0].nxdata)
-    k = np.asarray(slice_hk.nxaxes[1].nxdata)
-    l = np.asarray(slice_hl.nxaxes[1].nxdata)
-
-    # Global normalization range across all 3 slices
-    all_pos = np.concatenate([img_hk[img_hk > 0], img_hl[img_hl > 0], img_kl[img_kl > 0]])
-    vmin = max(1.0, float(np.nanpercentile(all_pos, 5)))
-    vmax = float(np.nanpercentile(all_pos, 99.8))
-    norm = LogNorm(vmin=vmin, vmax=vmax)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
-
-    # 1. HK Plane (X=H, Y=K) -> Aspect: b* / a*
-    im0 = axes[0].imshow(img_hk.T, origin="lower", extent=[h[0], h[-1], k[0], k[-1]],
-                         norm=norm, cmap="viridis", aspect=(b_star / a_star))
-    axes[0].set_xlabel(r"$H$ (r.l.u.)")
-    axes[0].set_ylabel(r"$K$ (r.l.u.)")
-    axes[0].set_title(f"$(HK{l_val:g})$ Slice")
-
-    # 2. HL Plane (X=H, Y=L) -> Aspect: c* / a*
-    axes[1].imshow(img_hl.T, origin="lower", extent=[h[0], h[-1], l[0], l[-1]],
-                   norm=norm, cmap="viridis", aspect=(c_star / a_star))
-    axes[1].set_xlabel(r"$H$ (r.l.u.)")
-    axes[1].set_ylabel(r"$L$ (r.l.u.)")
-    axes[1].set_title(f"$(H{k_val:g}L)$ Slice")
-
-    # 3. KL Plane (X=K, Y=L) -> Aspect: c* / b*
-    axes[2].imshow(img_kl.T, origin="lower", extent=[k[0], k[-1], l[0], l[-1]],
-                   norm=norm, cmap="viridis", aspect=(c_star / b_star))
-    axes[2].set_xlabel(r"$K$ (r.l.u.)")
-    axes[2].set_ylabel(r"$L$ (r.l.u.)")
-    axes[2].set_title(f"$({h_val:g}KL)$ Slice")
-
-    for ax in axes:
-        ax.xaxis.set_major_locator(MultipleLocator(2))
-        ax.xaxis.set_minor_locator(MultipleLocator(1))
-        ax.yaxis.set_major_locator(MultipleLocator(2))
-        ax.yaxis.set_minor_locator(MultipleLocator(1))
-        ax.tick_params(direction="in", top=True, right=True, which="both")
-
-    fig.subplots_adjust(right=0.90, wspace=0.25)
-    cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.70])
-    cbar = fig.colorbar(im0, cax=cbar_ax)
-    cbar.set_label("Intensity (counts)")
-
-    plt.savefig(out_png, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved 3-panel summary: {out_png}")
-```
-
----
-
-## 4. Standalone CLI Reference Scripts
-
-This skill includes turnkey standalone CLI tools in [`scripts/`](./scripts/):
-
-1. **`plot_slice.py`**:
-   ```bash
-   python scripts/plot_slice.py --nxs path/to/volume.nxs --plane HK --coord 0.0 --output slice_HK0.png
-   ```
-2. **`plot_summary.py`**:
-   ```bash
-   python scripts/plot_summary.py --nxs path/to/volume.nxs --output slices_summary.png --unit-cell "5.0027,5.0027,4.0548,90,90,120"
-   ```
-
----
-
-## 5. Sister Skills & Integration
-
-- For **Volume & Temperature Animations (GIF/MP4)**: Consult [`reciprocal-space-animation`](../reciprocal-space-animation/SKILL.md).
-- For **1D Linecuts with Scissors**: Consult [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
-- For **Temperature Series & TempDependence**: Consult [`temperature-series-analysis`](../temperature-series-analysis/SKILL.md).
-- For **Upstream Data Reduction & Streaming**: Consult [`chess-legacy-reduction`](../chess-legacy-reduction/SKILL.md).
+- [GIF scans](../reciprocal-space-animation/SKILL.md).
+- [Linecuts — TO BE UPDATED](../reciprocal-space-linecuts/SKILL.md).
+- [Temperature analysis — detailed validation TO BE UPDATED](../temperature-series-analysis/SKILL.md).
+- [Master guide and cluster execution](../reciprocal-space-analysis/SKILL.md).

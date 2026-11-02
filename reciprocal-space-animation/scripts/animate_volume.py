@@ -1,149 +1,144 @@
 #!/usr/bin/env python3
-"""
-animate_volume.py: Fast, memory-safe reciprocal space volume scan animator.
-Generates an animated GIF or MP4 scrolling along a designated reciprocal axis (H, K, or L).
+"""Make a GIF of native-coordinate reciprocal slices; MP4 is not supported.
+
+Slice selection and reciprocal geometry come from nxs_analysis_tools.reciprocal.
+Pillow retains rendered frames, so long GIFs still require substantial memory.
 """
 
-import os
-import sys
 import argparse
-import numpy as np
 import gc
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.colors import LogNorm
+import numpy as np
+import nexusformat.nexus as nx
 
-try:
-    import nexusformat.nexus as nx
-except ImportError:
-    nx = None
+from nxs_analysis_tools.reciprocal import (
+    physical_mesh,
+    reciprocal_axis_coordinates,
+    reciprocal_slice,
+    resolve_nxdata,
+    resolve_unit_cell,
+)
 
 
-def animate_volume(nxs_path, axis_name, out_path, fps=12, stride=2, vmin=None, vmax=None, cmap="viridis"):
-    if nx is None:
-        raise ImportError("nexusformat is required to run animate_volume.py")
+def _gif_destination(out_path):
+    """Fail early for the currently unsupported movie formats."""
+    destination = Path(out_path)
+    if destination.suffix.lower() != ".gif":
+        raise ValueError("This script currently exports GIF only; MP4/streaming export is deferred.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
 
+
+def _normalization(slices, vmin=None, vmax=None):
+    """Keep the existing sampled log normalization pending the separate review."""
+    positive = np.concatenate([np.asarray(s)[np.asarray(s) > 0] for s in slices])
+    if not len(positive):
+        positive = np.array([1.0, 10.0], dtype=np.float32)
+    lower = float(vmin) if vmin is not None else max(1.0, float(np.nanpercentile(positive, 5)))
+    upper = float(vmax) if vmax is not None else float(np.nanpercentile(positive, 99.8))
+    return LogNorm(vmin=lower, vmax=upper)
+
+
+def _display_geometry(section, data, coordinates="auto", unit_cell=None):
+    """Use the library's complete metric, or explicitly display native r.l.u."""
+    if coordinates not in {"auto", "rlu", "physical"}:
+        raise ValueError("coordinates must be auto, rlu, or physical")
+    # A requested schematic r.l.u. view does not depend on cell metadata.
+    cell = None if coordinates == "rlu" else resolve_unit_cell(data, unit_cell=unit_cell)
+    mode = "physical" if coordinates == "auto" and cell is not None else coordinates
+    if mode == "auto":
+        mode = "rlu"
+    horizontal, vertical = section.plane
+    if mode == "physical":
+        if cell is None:
+            raise ValueError("Physical coordinates require a native unit cell or --unit-cell a,b,c,alpha,beta,gamma")
+        x_mesh, y_mesh = physical_mesh(section, cell)
+        x_label = f"q parallel to {horizontal}* (Å⁻¹; no 2π)"
+        y_label = f"q perpendicular to {horizontal}* in {section.plane} plane (Å⁻¹)"
+    else:
+        x_mesh, y_mesh = np.meshgrid(section.x_edges, section.y_edges)
+        x_label, y_label = f"{horizontal} (r.l.u.)", f"{vertical} (r.l.u.)"
+    return x_mesh, y_mesh, x_label, y_label, mode
+
+
+def _start_mesh(ax, section, data, norm, cmap, coordinates="auto", unit_cell=None):
+    x_mesh, y_mesh, x_label, y_label, mode = _display_geometry(
+        section, data, coordinates=coordinates, unit_cell=unit_cell
+    )
+    mesh = ax.pcolormesh(x_mesh, y_mesh, section.values, shading="flat", norm=norm, cmap=cmap)
+    ax.set_aspect("equal")
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel(y_label, fontsize=11)
+    return mesh, mode
+
+
+def animate_volume(nxs_path, axis_name, out_path, fps=12, stride=2,
+                   vmin=None, vmax=None, cmap="viridis", coordinates="auto", unit_cell=None):
+    """Scroll through bin centers of H, K, or L, independent of storage order."""
+    destination = _gif_destination(out_path)
     nx.nxsetmemory(20000)
     root = nx.nxload(nxs_path)
-    if hasattr(root, "entry") and hasattr(root.entry, "data"):
-        data = root.entry.data
-    elif hasattr(root, "entry") and hasattr(root.entry, "transform"):
-        data = root.entry.transform
-    else:
-        raise ValueError(f"Could not find valid NXdata in {nxs_path}")
-
+    data = resolve_nxdata(root)
     axis_name = axis_name.upper()
-    axes = [ax.nxname for ax in data.nxaxes]
-    is_nxrefine = ("Ql" in axes or "ql" in [a.lower() for a in axes])
+    planes = {"H": "KL", "K": "HL", "L": "HK"}
+    if axis_name not in planes:
+        raise ValueError("axis_name must be H, K, or L")
+    centers, _ = reciprocal_axis_coordinates(data, axis_name)
+    coord_arr = centers[::max(1, int(stride))]
+    if not len(coord_arr):
+        raise ValueError("No reciprocal coordinate bins to animate")
+    plane = planes[axis_name]
 
-    # Map axis to index
-    if is_nxrefine:
-        axis_map = {"L": 0, "K": 1, "H": 2}
-    else:
-        axis_map = {"H": 0, "K": 1, "L": 2}
+    def frame(index):
+        return reciprocal_slice(data, plane=plane, coord=float(coord_arr[index]))
 
-    if axis_name not in axis_map:
-        raise ValueError(f"Invalid axis: {axis_name}. Choose from H, K, L.")
-
-    scan_idx = axis_map[axis_name]
-    coord_arr = np.asarray(data.nxaxes[scan_idx].nxdata)[::max(1, int(stride))]
     n_frames = len(coord_arr)
-    print(f"Generating animation along {axis_name} across {n_frames} frames (stride={stride})...")
-
-    # Determine free 2D axes
-    free_indices = [i for i in range(3) if i != scan_idx]
-    x_name = data.nxaxes[free_indices[0]].nxname
-    y_name = data.nxaxes[free_indices[1]].nxname
-    x_coords = np.asarray(data.nxaxes[free_indices[0]].nxdata)
-    y_coords = np.asarray(data.nxaxes[free_indices[1]].nxdata)
-
-    # Establish global vmin/vmax across sample slices
-    sample_sub = [coord_arr[i] for i in range(0, n_frames, max(1, n_frames // 4))]
-    sample_slices = []
-    for c in sample_sub:
-        if scan_idx == 0:
-            s = np.asarray(data[c, :, :].nxsignal.nxdata, dtype=np.float32)
-        elif scan_idx == 1:
-            s = np.asarray(data[:, c, :].nxsignal.nxdata, dtype=np.float32)
-        else:
-            s = np.asarray(data[:, :, c].nxsignal.nxdata, dtype=np.float32)
-        sample_slices.append(s)
-    
-    pos = np.concatenate([s[s > 0] for s in sample_slices])
-    if len(pos) == 0:
-        pos = np.array([1.0, 10.0], dtype=np.float32)
-    _vmin = float(vmin) if vmin is not None else max(1.0, float(np.nanpercentile(pos, 5)))
-    _vmax = float(vmax) if vmax is not None else float(np.nanpercentile(pos, 99.8))
-
-    # Initialize plot
+    samples = [frame(i).values for i in range(0, n_frames, max(1, n_frames // 4))]
+    norm = _normalization(samples, vmin=vmin, vmax=vmax)
+    first = frame(0)
     fig, ax = plt.subplots(figsize=(6, 5), dpi=140)
-    if scan_idx == 0:
-        init_s = np.asarray(data[coord_arr[0], :, :].nxsignal.nxdata, dtype=np.float32)
-    elif scan_idx == 1:
-        init_s = np.asarray(data[:, coord_arr[0], :].nxsignal.nxdata, dtype=np.float32)
-    else:
-        init_s = np.asarray(data[:, :, coord_arr[0]].nxsignal.nxdata, dtype=np.float32)
+    try:
+        mesh, mode = _start_mesh(ax, first, data, norm, cmap, coordinates, unit_cell)
+        title = ax.set_title(f"{plane} slice: {axis_name} = {first.actual_coord:g} r.l.u. ({mode})")
+        fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04, label="Intensity")
 
-    im = ax.imshow(
-        init_s.T,
-        origin="lower",
-        extent=[x_coords[0], x_coords[-1], y_coords[0], y_coords[-1]],
-        norm=LogNorm(vmin=_vmin, vmax=_vmax),
-        cmap=cmap,
-        aspect=1.0,
-    )
-    ax.set_xlabel(f"{x_name} (r.l.u.)", fontsize=11)
-    ax.set_ylabel(f"{y_name} (r.l.u.)", fontsize=11)
-    title_text = ax.set_title(f"Volume Scan along {axis_name}: {coord_arr[0]:.2f} r.l.u.", fontsize=12)
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Intensity (counts)", fontsize=10)
+        def update(index):
+            section = frame(index)
+            mesh.set_array(section.values.ravel())
+            title.set_text(f"{plane} slice: {axis_name} = {section.actual_coord:g} r.l.u. ({mode})")
+            return mesh, title
 
-    def update(frame_idx):
-        c = coord_arr[frame_idx]
-        if scan_idx == 0:
-            s_2d = np.asarray(data[c, :, :].nxsignal.nxdata, dtype=np.float32)
-        elif scan_idx == 1:
-            s_2d = np.asarray(data[:, c, :].nxsignal.nxdata, dtype=np.float32)
-        else:
-            s_2d = np.asarray(data[:, :, c].nxsignal.nxdata, dtype=np.float32)
-        im.set_data(s_2d.T)
-        title_text.set_text(f"Volume Scan along {axis_name}: {c:.2f} r.l.u.")
-        return [im, title_text]
-
-    anim = FuncAnimation(fig, update, frames=n_frames, blit=True)
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    writer = PillowWriter(fps=fps)
-    anim.save(out_path, writer=writer)
-    plt.close(fig)
-    gc.collect()
-    print(f"Exported volume scan animation: {out_path}")
+        animation = FuncAnimation(fig, update, frames=n_frames, blit=True)
+        animation.save(str(destination), writer=PillowWriter(fps=fps))
+    finally:
+        plt.close(fig)
+        gc.collect()
+    print(f"Exported {n_frames} {plane} slices along {axis_name}: {destination}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Animate scrolling through reciprocal space volume.")
-    parser.add_argument("--nxs", required=True, help="Path to 3D NeXus reciprocal volume (.nxs)")
-    parser.add_argument("--axis", default="L", choices=["H", "K", "L"], help="Axis to scan (default: L)")
-    parser.add_argument("--output", "-o", required=True, help="Destination GIF or MP4 path")
-    parser.add_argument("--stride", type=int, default=2, help="Frame stride along scan axis (default: 2)")
-    parser.add_argument("--fps", type=int, default=12, help="Animation playback speed (fps)")
-    parser.add_argument("--vmin", type=float, default=None, help="LogNorm minimum intensity")
-    parser.add_argument("--vmax", type=float, default=None, help="LogNorm maximum intensity")
-    parser.add_argument("--cmap", default="viridis", help="Colormap (default: viridis)")
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--nxs", required=True, help="3D reciprocal NeXus volume")
+    parser.add_argument("--axis", default="L", choices=["H", "K", "L"])
+    parser.add_argument("--output", "-o", required=True, help="Destination GIF path; MP4 is not supported")
+    parser.add_argument("--stride", type=int, default=2)
+    parser.add_argument("--fps", type=int, default=12)
+    parser.add_argument("--vmin", type=float)
+    parser.add_argument("--vmax", type=float)
+    parser.add_argument("--cmap", default="viridis")
+    parser.add_argument("--coordinates", choices=["auto", "rlu", "physical"], default="auto",
+                        help="auto uses a native/explicit cell for physical geometry; otherwise rlu")
+    parser.add_argument("--unit-cell", help="a,b,c,alpha,beta,gamma; explicit cell overrides native metadata")
     args = parser.parse_args()
-    animate_volume(
-        nxs_path=args.nxs,
-        axis_name=args.axis,
-        out_path=args.output,
-        fps=args.fps,
-        stride=args.stride,
-        vmin=args.vmin,
-        vmax=args.vmax,
-        cmap=args.cmap,
-    )
+    animate_volume(args.nxs, args.axis, args.output, fps=args.fps, stride=args.stride,
+                   vmin=args.vmin, vmax=args.vmax, cmap=args.cmap,
+                   coordinates=args.coordinates, unit_cell=args.unit_cell)
 
 
 if __name__ == "__main__":

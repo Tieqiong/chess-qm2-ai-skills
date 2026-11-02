@@ -1,6 +1,9 @@
 ---
 name: temperature-series-analysis
 description: >-
+  API compatibility repaired; detailed temperature analysis is TO BE UPDATED.
+  Outputs remain exploratory, not quantitatively validated. Discovery/grid,
+  masks/log, and export/memory work are on hold.
   Analyze CHESS temperature-dependent diffraction datasets using TempDependence and
   TempDict from nxs_analysis_tools. Use when performing batch operations across an entire
   temperature series at once (e.g., batch Scissors linecuts), generating waterfall plots,
@@ -9,6 +12,14 @@ description: >-
 ---
 
 # CHESS Temperature-Dependent Data Analysis Skill (`temperature-series-analysis`)
+
+> **Status: API compatibility repaired; detailed analysis TO BE UPDATED.**
+> The wrappers now pass explicit cut arguments, use supported plotting calls,
+> resolve physical cut axes, and map the fitted parameter names correctly.
+> This does not make their results ready for quantitative interpretation.
+> Temperature discovery/grid validation, masks/log handling, and exports/memory
+> work are on hold. All standalone linecut work is also **TO BE UPDATED**.
+> See [analysis status](../docs/reciprocal-analysis-status.md).
 
 This skill provides operational workflows, API runbooks, and reference scripts for analyzing multi-temperature reciprocal space series at the CHESS ID4B/QM2 beamline using `nxs_analysis_tools.chess.TempDependence`.
 
@@ -36,7 +47,7 @@ The `TempDependence` class wraps a collection of temperature datasets into a uni
 
 ## 2. Standard Workflow & API Runbook
 
-### Step 1: Initialization & Temperature Discovery
+### Step 1: Initialization & Temperature Discovery — validation ON HOLD / TO BE UPDATED
 
 ```python
 from nxs_analysis_tools.chess import TempDependence
@@ -64,15 +75,20 @@ Instead of iterating through temperatures with a for-loop, configure the lattice
 # 1. Set unit cell (a, b, c, alpha, beta, gamma)
 td.set_lattice_params((5.0027, 5.0027, 4.0548, 90.0, 90.0, 120.0))
 
-# 2. Set center of the target reflection (H, K, L)
-td.set_center((1.0, 0.0, 0.0))
+# 2. Resolve H from the actual stored axis labels; require one native layout.
+from nxs_analysis_tools.reciprocal import resolve_reciprocal_axes
+axis_maps = [resolve_reciprocal_axes(td.datasets[T]) for T in td.temperatures]
+if not axis_maps or any(m != axis_maps[0] for m in axis_maps):
+    raise ValueError("No loaded data or mixed native axis ordering; process separately")
 
-# 3. Set window (integration thickness along transverse axes, cut bounds along main axis)
-td.set_window((0.5, 0.1, 0.1))
-
-# 4. Execute batch cut across all temperatures in a single call!
-# axis: 0 for H, 1 for K, 2 for L (Legacy CHESS)
-td.cut_data(axis=0)
+# 3. These center/window tuples are for native (H,K,L) order only.
+# For native (Ql,Qk,Qh), use center=(0,0,1), window=(0.1,0.1,0.5).
+# Scissors window values are half-widths. Pass them explicitly to cut_data.
+center = (1.0, 0.0, 0.0)
+window = (0.5, 0.1, 0.1)
+if tuple(axis_maps[0][a] for a in ("H", "K", "L")) != (0, 1, 2):
+    raise ValueError("Adapt the native-order tuples before running this HKL example")
+td.cut_data(center=center, window=window, axis=axis_maps[0]["H"])
 ```
 
 ---
@@ -90,16 +106,18 @@ fig, ax = plt.subplots(figsize=(7, 8), dpi=200)
 td.plot_linecuts(
     ax=ax,
     vertical_offset=500.0,  # Vertical spacing between temperature traces
-    cmap="coolwarm",        # Temperature-mapped colormap
 )
+# TempDependence supplies its supported line colors; cmap is not accepted here.
 ax.set_title(r"Temperature Evolution through $(1, 0, 0)$ Reflection")
 plt.tight_layout()
 plt.savefig("waterfall_linecuts.png", dpi=300)
 plt.close(fig)
 ```
 
-#### B. $(Q, T)$ 2D False-Color Heatmap
+#### B. $(Q, T)$ 2D False-Color Heatmap — grid validation ON HOLD
 Renders a continuous intensity surface where the x-axis is reciprocal coordinate $Q$, the y-axis is temperature $T$, and color represents scattering intensity:
+the current plotting API assumes matching cut coordinates across temperatures.
+It does not check or align grids; that validation remains **TO BE UPDATED**.
 ```python
 fig, ax = plt.subplots(figsize=(6, 5), dpi=200)
 td.plot_linecuts_heatmap(ax=ax, cmap="inferno")
@@ -122,7 +140,7 @@ plt.close(fig)
 
 ---
 
-### Step 4: Peak Fitting & Order Parameter Extraction
+### Step 4: Exploratory Peak Fitting — quantitative analysis TO BE UPDATED
 
 ```python
 # 1. Define model components (e.g. Gaussian peak + Linear background)
@@ -140,10 +158,10 @@ td.print_fit_report()
 
 # 4. Plot order parameter (peak height vs temperature)
 fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
-td.plot_order_parameter(param_name="peakheight", ax=ax, marker="o", color="crimson")
+td.plot_order_parameter(param_name="peak_height", ax=ax, marker="o", color="crimson")
 ax.set_xlabel("Temperature (K)", fontsize=11)
 ax.set_ylabel("Peak Intensity (counts)", fontsize=11)
-ax.set_title("Order Parameter: $I(T)$ across Transition", fontsize=12)
+ax.set_title("Exploratory fitted peak height vs temperature", fontsize=12)
 ax.grid(True, linestyle="--", alpha=0.5)
 plt.tight_layout()
 plt.savefig("order_parameter.png", dpi=300)
@@ -152,9 +170,11 @@ plt.close(fig)
 
 ---
 
-### Step 5: Downstream Export to 4D NeXus (`td.to_xtec()`)
+### Step 5: Downstream Export to 4D NeXus (`td.to_xtec()`) — ON HOLD / TO BE UPDATED
 
 When preparing a complete temperature series for unsupervised clustering in `xtec-gpu-analysis`:
+the following historical example has not received the deferred grid, export or
+memory review. Do not infer streaming behavior or validated series alignment.
 ```python
 # Compiles a 4D NeXus array (shape: N_T x N_H x N_K x N_L)
 td.to_xtec(
@@ -167,7 +187,11 @@ td.to_xtec(
 
 ## 3. Standalone CLI Reference Scripts
 
-This skill includes turnkey standalone CLI tools in [`scripts/`](./scripts/):
+This skill includes exploratory CLI tools in [`scripts/`](./scripts/). Only the
+API compatibility repair is complete. Both require the updated
+`nxs_analysis_tools.reciprocal.resolve_reciprocal_axes` helper. Center/window
+tuples follow the data's native axis order; mixed ordering across temperatures
+is explicitly unsupported. Equal axes alone do not validate equal grids.
 
 1. **`batch_temp_linecuts.py`**:
    Discovers all temperatures in a sample folder, extracts a batch `Scissors` cut, and exports both a waterfall plot and a $(Q, T)$ heatmap:
@@ -182,15 +206,23 @@ This skill includes turnkey standalone CLI tools in [`scripts/`](./scripts/):
    ```
 
 2. **`temp_order_parameter.py`**:
-   Fits a reflection across temperatures and generates the order parameter curve:
+   Fits a reflection across temperatures and plots a selected peak parameter:
    ```bash
    python scripts/temp_order_parameter.py \
      --sample-dir /path/to/sample_root \
      --file-ending "3rot_hkli_lite.nxs" \
+     --axis H \
      --center "1.0, 0.0, 0.0" \
      --window "0.5, 0.1, 0.1" \
      --output order_parameter.png
    ```
+
+   CLI quantities map to lmfit parameters: `peakheight` → `peak_height`,
+   `area` → `peak_amplitude`, `sigma` → `peak_sigma`, `center` → `peak_center`.
+   The default height is width-dependent; neither height nor area alone is a
+   validated thermodynamic order parameter. Fit quality, uncertainties and
+   quantitative interpretation remain **TO BE UPDATED**. Figures are the only
+   current outputs; numerical result exports remain on hold.
 
 ---
 
@@ -198,5 +230,5 @@ This skill includes turnkey standalone CLI tools in [`scripts/`](./scripts/):
 
 - For **Single-Volume Slicing & Plotting**: Consult [`reciprocal-space-plotting`](../reciprocal-space-plotting/SKILL.md).
 - For **Animations (GIF/MP4)**: Consult [`reciprocal-space-animation`](../reciprocal-space-animation/SKILL.md).
-- For **Single-Volume 1D Linecuts**: Consult [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
+- For **Single-Volume 1D Linecuts — ALL TO BE UPDATED**: See the deferred [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
 - For **GPU Clustering (XTEC)**: Consult [`xtec-gpu-analysis`](../xtec-gpu-analysis/SKILL.md) after running `td.to_xtec()`.

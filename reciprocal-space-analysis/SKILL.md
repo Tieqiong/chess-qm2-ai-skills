@@ -5,7 +5,7 @@ description: >-
   space X-ray and neutron diffraction datasets (NeXus/HDF5) using nxs_analysis_tools.
   Covers coordinate frames, lazy hyperslab slicing, non-orthogonal lattice skew,
   and cluster execution. Delegates specialized tasks to modular sister skills:
-  reciprocal-space-plotting (2D slices), reciprocal-space-animation (GIF/MP4 scans),
+  reciprocal-space-plotting (2D slices), reciprocal-space-animation (GIF scans),
   reciprocal-space-linecuts (1D Scissors cuts), and temperature-series-analysis (TempDependence).
 ---
 
@@ -14,6 +14,15 @@ description: >-
 This skill provides comprehensive guidelines, mathematical formulas, and operational best practices for analyzing, indexing, comparing, and visualizing 3D reciprocal space diffraction datasets (e.g., from CHESS ID4B/QM2 beamlines or similar synchrotron/neutron facilities) using `nxs_analysis_tools`.
 
 ---
+
+## Current implementation status
+
+The slicing and GIF scripts use the shared `nxs_analysis_tools.reciprocal` API
+in [Tieqiong's analysis-library fork](https://github.com/Tieqiong/nxs_analysis_tools/tree/codex/reciprocal-slicing).
+Use the updated library checkout with these scripts. Native axis metadata and
+full reciprocal-metric rendering are the current focus. **All linecuts are TO BE
+UPDATED**; detailed temperature validation, intensity/mask policy, and broader
+animation export remain deferred. See [the maintained status table](../docs/reciprocal-analysis-status.md).
 
 ## 1. Upstream AI Skills & Dynamic Documentation Links
 
@@ -70,7 +79,7 @@ If unattended authentication fails:
      ```bash
      qsub -q 'all.q@lnx307*,all.q@lnx311*,all.q@lnx312*,all.q@lnx313*' -l mem_free=200G -pe sge_pe 32 <job>.sh
      ```
-   - **Downstream Data Analysis** (`nxs_analysis_tools`): Fast, operates on already-converted volumes with lazy loading ($O(1)$ RAM). Executed inside interactive `qrsh` sessions or short batch jobs.
+   - **Downstream Data Analysis** (`nxs_analysis_tools`): Operates on already-converted volumes. Plane extraction is lazy; memory scales with loaded slabs, and Pillow GIF export also retains rendered frames. Executed inside interactive `qrsh` sessions or short batch jobs.
 3. **Mandatory "Show-Before-Submit" Verification Gate**:
    - Prior to executing `qsub <job_script>.sh` for any task, the assistant MUST present the complete script text to the user, highlighting queue targets, memory requests, slot allocations, environment path, and CLI invocation. The user must provide confirmation before the job is submitted.
 4. **Headless Execution**:
@@ -121,7 +130,9 @@ Because NXRefine and Legacy CHESS data structures use different axis ordering co
 - **Float index** (`data[:, 0.0, :]`): Queries the **physical reciprocal space coordinate** ($K = 0.0$).
 - **Rule**: Always use float literals (`0.0`, `1.5`) when selecting reciprocal cuts.
 
-### 3.4 Scissors & Linecut Coordinates
+### 3.4 Scissors & Linecut Coordinates — TO BE UPDATED
+
+The following describes native coordinate ordering only. Linecut window, aggregation, background, coverage and uncertainty contracts remain deferred; do not treat the standalone tools as validated quantitative extraction.
 `Scissors.cut_data()` maps coordinates positionally to `data.nxaxes`:
 - **For NXRefine** (`['Ql', 'Qk', 'Qh']`), `center` and `window` tuples must follow **$(L, K, H)$** order:
   ```python
@@ -134,7 +145,7 @@ Because NXRefine and Legacy CHESS data structures use different axis ordering co
   scissors.cut_data(center=(-0.5, 0.0, 0.0), window=(0.25, 0.2, 0.2))
   ```
 
-### 3.5 Temperature Series Discovery & Normalization
+### 3.5 Temperature Keys — Detailed Analysis TO BE UPDATED
 - Temperature keys can appear as integers (`15`), floats (`15.5`), or filesystem string notation (`'15p5'`).
 - `TempDict` provides transparent polymorphic access:
   ```python
@@ -143,61 +154,53 @@ Because NXRefine and Legacy CHESS data structures use different axis ordering co
 - **Discovery**: Always discover temperatures dynamically using `sample.find_temperatures()`.
 - **Loading**: Use `sample.load_datasets(temperatures=[...])`.
 
-### 3.6 Colormaps, LogNorm & True Physical Aspect Ratio Calibration
-- **LogNorm Cutoffs**: In `plot_slice(..., logscale=True)`, set `vmin > 0` (e.g. `vmin=1, vmax=1e4`) to avoid `LogNorm` errors on zero or negative masked counts.
-- **Lattice Skew**: For non-orthogonal / hexagonal systems (`@angles = [60.0, 90.0, 90.0]`), set `skew_angle=gamma_star` (e.g. `skew_angle=60`) in `plot_slice` to project true reciprocal lattice parallelogram geometry.
-- **Physical Aspect Ratio Calibration (`reciprocal_lattice_params`)**:
-  - `plot_slice()` automatically sets `ax.set(aspect=np.cos(shear_angle))` (which equals $\sin(\theta_{\text{skew}})$) to correct for shear distortion assuming equal physical reciprocal lengths ($v_X^* = v_Y^*$).
-  - When reciprocal lattice vectors differ in physical length ($a^* \ne b^*$ or along out-of-plane cuts $(HL), (KL)$ where $c^* \ne a^*, b^*$), calculate reciprocal lattice parameters using `reciprocal_lattice_params(lattice_params)`:
-    ```python
-    from nxs_analysis_tools.datareduction import reciprocal_lattice_params
+### 3.6 Native Slicing and Full Reciprocal Geometry
 
-    a_star, b_star, c_star, alpha_star, beta_star, gamma_star = reciprocal_lattice_params(
-        (a, b, c, alpha, beta, gamma)
-    )
-    ```
-  - Apply the physical aspect ratio calibration immediately after calling `plot_slice()`:
-    $$\boxed{A_{\text{final}} = \frac{v_Y^*}{v_X^*} \times \text{ax.get\_aspect()}}$$
-    ```python
-    # HK Plane (X=H, Y=K):
-    plot_slice(nx_hk, skew_angle=gamma_star, ax=ax_hk, ...)
-    ax_hk.set_aspect(ax_hk.get_aspect() * (b_star / a_star))
+Resolve H/K/L by the actual `NXdata.nxaxes` metadata, accepting native H/K/L or
+Qh/Qk/Ql names in any dimension order. The tables above illustrate common
+storage conventions; they are not substitutes for metadata resolution.
 
-    # HL Plane (X=H, Y=L):
-    plot_slice(nx_hl, skew_angle=beta_star, ax=ax_hl, ...)
-    ax_hl.set_aspect(ax_hl.get_aspect() * (c_star / a_star))
+```python
+from nxs_analysis_tools.reciprocal import (
+    resolve_nxdata, reciprocal_slice, resolve_unit_cell, physical_mesh,
+)
 
-    # KL Plane (X=K, Y=L):
-    plot_slice(nx_kl, skew_angle=alpha_star, ax=ax_kl, ...)
-    ax_kl.set_aspect(ax_kl.get_aspect() * (c_star / b_star))
-    ```
-  - This ensures that $1\text{ \AA}^{-1}$ occupies the exact same screen pixel length in every physical direction, preserving circular diffuse scattering rings and preventing elongation along the $L$ axis.
+data = resolve_nxdata(root)
+section = reciprocal_slice(data, plane="HK", coord=0.0)
+# values are already (vertical, horizontal); no format-dependent transpose.
+cell = resolve_unit_cell(data)  # native NXentry/sample/unit_cell, or an explicit override
+```
 
-### 3.7 Default Crystallographic Grid Lines & Integer Ticks Standards
-All 2D reciprocal space slice plots must include default grid lines and integer tick formatting:
-- **Skew-Aligned Grid Lines (Matching Crystallographic Axes)**:
-  Under sheared projections (`skew_angle != 90`), standard Cartesian `ax.grid()` draws erroneous orthogonal lines. Instead, render grid lines in reciprocal data coordinates transformed via `quadmesh.get_transform()` so they strictly follow the true crystallographic `skew_angle` (e.g. $60^\circ$ for hexagonal $HK$):
-  ```python
-  from matplotlib.ticker import MultipleLocator
-  from matplotlib.collections import LineCollection
+Coordinates select the containing bin; record `section.actual_coord` and
+`section.fixed_edges` rather than labeling the request as an exact measurement.
+Center arrays and native bin-edge arrays are supported. Out-of-range selections
+and ambiguous axis metadata fail explicitly. Only the selected plane is loaded.
 
-  # 1. Ticks: Major on integers, Minor mandatory on every integer (1.0)
-  ax.xaxis.set_major_locator(MultipleLocator(2 if (xmax - xmin) > 8 else 1))
-  ax.xaxis.set_minor_locator(MultipleLocator(1))
-  ax.yaxis.set_major_locator(MultipleLocator(2 if (ymax - ymin) > 8 else 1))
-  ax.yaxis.set_minor_locator(MultipleLocator(1))
-  ax.tick_params(direction='in', top=True, right=True, which='both')
+With a cell, `physical_mesh(section, cell)` maps the bin corners into the
+plane-local Cartesian reciprocal coordinates. For HK:
 
-  # 2. Skew-aligned grid lines matching data coordinate transform
-  trans = im.get_transform()
-  h_ints = np.arange(int(np.ceil(xmin)), int(np.floor(xmax)) + 1, 1)
-  k_ints = np.arange(int(np.ceil(ymin)), int(np.floor(ymax)) + 1, 1)
-  h_lines = [[(h, ymin), (h, ymax)] for h in h_ints]
-  k_lines = [[(xmin, k), (xmax, k)] for k in k_ints]
-  lc = LineCollection(h_lines + k_lines, transform=trans, colors='gray', linestyles='--', linewidths=0.5, alpha=0.5, zorder=2)
-  ax.add_collection(lc)
-  ```
-- **Major and Minor Ticks**: Major ticks are placed strictly on integer multiples (`MultipleLocator`), while minor ticks are mandatory on every single integer.
+$$X=a^*H+b^*\cos(\gamma^*)K,\qquad Y=b^*\sin(\gamma^*)K.$$
+
+Use `pcolormesh(X, Y, section.values, shading="flat")` and equal aspect. The same
+construction uses the corresponding basis for HL and KL. Units are Å⁻¹ without
+2π, and the origin lies at zero free coordinates in the selected plane. This
+preserves lengths and angles even when reciprocal vectors are unequal and oblique.
+Multiplying a fixed shear's aspect by a reciprocal-length ratio is not sufficient.
+
+CLI display modes are `auto` (physical when a cell is available, r.l.u. otherwise),
+`physical` (requires a cell), and `rlu` (rectangular Miller-coordinate view).
+Missing or invalid cell metadata must not silently become a cubic physical metric.
+
+### 3.7 Display and Deferred Intensity Policy
+
+In the r.l.u. view, label axes H/K/L and use integer locators when appropriate.
+Physical views have Cartesian plane-local axes in Å⁻¹; use physical-coordinate
+ticks, not integer Miller labels. Native bin edges define the plotted mesh.
+
+Mask/coverage validation and automatic color scaling are **TO BE UPDATED**.
+Current CLI automatic limits retain the old count-oriented lower floor of 1;
+provide explicit positive `vmin`/`vmax` for sub-unit intensities. Do not interpret
+logarithmic plots of signed differences as validated intensity comparisons.
 
 ### 3.8 Mandatory Lazy Slicing Protocol (No Eager Full-Volume Reads)
 - **Hierarchy Traversal is Lazy**: Assigning `data = nx_obj.entry.data` or querying child fields (`data.counts`) does **not** load array data. The `NXfield` object retains `_value = None` and only holds an HDF5 dataset reference.
@@ -217,7 +220,7 @@ flowchart LR
     VOL --> MASTER["reciprocal-space-analysis\n(Master Guide)"]
     
     MASTER --> PLOT["reciprocal-space-plotting\n(2D Slices & 3-Panel)"]
-    MASTER --> ANIM["reciprocal-space-animation\n(GIF/MP4 Scans)"]
+    MASTER --> ANIM["reciprocal-space-animation\n(GIF Scans)"]
     MASTER --> CUTS["reciprocal-space-linecuts\n(1D Scissors Cuts)"]
     MASTER --> TEMP["temperature-series-analysis\n(TempDependence Batch Ops)"]
     
@@ -225,9 +228,9 @@ flowchart LR
 ```
 
 - **2D Slice Visualization & Publication Figures**: For generating 2D cross-sections (HK, HL, KL), 3-panel summary plots, physical aspect ratio ($b^*/a^*$) corrections, and crystallographic skew grids, consult [`reciprocal-space-plotting`](../reciprocal-space-plotting/SKILL.md).
-- **Volumetric & Thermal Animations**: For exporting scrolling axis scans ($L$-scans) or temperature series evolution into GIF or MP4 media, consult [`reciprocal-space-animation`](../reciprocal-space-animation/SKILL.md).
-- **1D Peak Cuts & Scissors Extraction**: For single-volume linecuts, transverse integration windows, and peak integration, consult [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
-- **Multi-Temperature Series & TempDependence**: For batch operations across entire temperature series at once (batch Scissors, waterfall plots, $(Q, T)$ heatmaps, order parameter fitting), consult [`temperature-series-analysis`](../temperature-series-analysis/SKILL.md).
+- **Volumetric & Thermal Animations**: For exporting scrolling axis scans ($L$-scans) or verified temperature series into GIF media, consult [`reciprocal-space-animation`](../reciprocal-space-animation/SKILL.md). MP4 and streaming export remain deferred.
+- **1D Peak Cuts & Scissors Extraction — TO BE UPDATED**: For single-volume linecuts, transverse integration windows, and peak integration, consult [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
+- **Multi-Temperature Series & TempDependence — Detailed Analysis TO BE UPDATED**: For batch operations across entire temperature series at once (batch Scissors, waterfall plots, $(Q, T)$ heatmaps, order parameter fitting), consult [`temperature-series-analysis`](../temperature-series-analysis/SKILL.md).
 - **Upstream Data Reduction & Streaming**: For converting raw Pilatus CBF detector sweeps into 3D reciprocal space NeXus volumes, consult [`chess-legacy-reduction`](../chess-legacy-reduction/SKILL.md).
 - **Downstream Phase Clustering**: For clustering temperature-series reciprocal space datasets with GPU acceleration (PyTorch / `torchgmm`), consult [`xtec-gpu-analysis`](../xtec-gpu-analysis/SKILL.md).
 
