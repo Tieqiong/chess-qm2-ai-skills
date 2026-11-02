@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-extract_linecut.py: Standalone 1D reciprocal space linecut extractor and plotter.
-Uses nxs_analysis_tools.Scissors or fallback HDF5 hyperslab integration.
+TO BE UPDATED: all standalone linecut analysis is deferred and unvalidated.
+extract_linecut.py: Historical 1D reciprocal space linecut extractor and plotter.
+Retains nxs_analysis_tools.Scissors and the existing manual fallback.
+Known backend differences in window/reduction semantics remain unresolved;
+do not use this script for quantitative analysis pending its update.
 """
 
 import os
@@ -32,6 +35,8 @@ def parse_tuple(s, expected_len=3):
 
 
 def extract_linecut(nxs_path, cut_axis, center_str, window_str, out_png, out_csv=None):
+    print("TO BE UPDATED: all linecut analysis is deferred; backend/window semantics "
+          "and quantitative output are not validated.", file=sys.stderr)
     if nx is None:
         raise ImportError("nexusformat is required to run extract_linecut.py")
 
@@ -116,7 +121,8 @@ def extract_linecut(nxs_path, cut_axis, center_str, window_str, out_png, out_csv
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract and plot 1D reciprocal space linecut using Scissors.")
+    parser = argparse.ArgumentParser(description="TO BE UPDATED: historical linecut utility; "
+                                     "all linecut analysis is deferred and not validated for quantitative use.")
     parser.add_argument("--nxs", required=True, help="Path to NeXus volume (.nxs)")
     parser.add_argument("--axis", required=True, choices=["H", "K", "L"], help="Direction of 1D cut")
     parser.add_argument("--center", required=True, help="Center coordinate tuple: 'c0, c1, c2'")

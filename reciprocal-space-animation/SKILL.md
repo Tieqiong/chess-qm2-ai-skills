@@ -1,196 +1,120 @@
 ---
 name: reciprocal-space-animation
 description: >-
-  Generate high-quality dynamic animations (GIF, MP4) of 3D reciprocal space X-ray
-  and neutron diffraction datasets (NeXus/HDF5). Use when generating volumetric axis
-  scans (scrolling through L, H, or K slices), animating temperature-series evolution
-  across phase transitions, managing headless rendering memory leaks, or exporting
-  animated figures for presentations and reports.
+  Generate GIFs that scroll through native reciprocal H/K/L slices or show a
+  verified temperature series. Use metadata-based plane selection and optional
+  physical reciprocal geometry. MP4 and bounded-memory streaming are not yet
+  implemented; temperature discovery, grid reconciliation and log/mask handling
+  have documented remaining limitations.
 ---
 
-# Reciprocal Space Animation Skill (`reciprocal-space-animation`)
+# Reciprocal-space GIFs
 
-This skill provides operational standards, memory management protocols, and copy-paste-ready recipes for animating 3D reciprocal space volumes and temperature series into GIF or MP4 media using `matplotlib.animation` or `imageio`.
+Use the standalone scripts below with an environment containing the updated
+`nxs_analysis_tools.reciprocal` module, `nexusformat`, Matplotlib and Pillow.
+The scripts read each plane lazily; they do not need the entire 3D signal in memory.
+Run beamline work on an allocated compute worker, following the repository's
+[compute rules](../GEMINI.md).
 
----
+## Native planes and coordinates
 
-## 1. Golden Rules of Animation Generation
+Both scripts use `resolve_nxdata` and `reciprocal_slice` from
+`nxs_analysis_tools.reciprocal`. Native axis metadata determines storage order:
+legacy `[H,K,L]`, NXRefine `[Ql,Qk,Qh]`, and other valid permutations resolve to
+the same canonical display. HK fixes L, HL fixes K, and KL fixes H. Frame titles
+show the actual selected reciprocal-bin center, which may differ slightly from
+the requested coordinate.
 
-1. **Memory Leak Prevention (`gc.collect()` & Frame Re-use)**:
-   Generating a 50–200 frame animation can rapidly consume gigabytes of memory if new `Figure` or `Axes` objects are instantiated per frame.
-   - **Mandatory Pattern**: Instantiate `fig, ax, im` **once**, and update `im.set_data(...)` and text labels dynamically in the animation loop.
-   - Explicitly call `plt.close(fig)` and `gc.collect()` immediately after saving.
-2. **Lazy Slice Extraction**:
-   Do not load the entire 3D volume into an eager 3D NumPy array prior to animation. Read each 2D slice hyperslab lazily inside the generator:
-   ```python
-   # Reads only the current 2D plane from disk per frame:
-   slice_data = np.asarray(data[:, :, l_val].nxsignal.nxdata, dtype=np.float32)
-   ```
-3. **Fixed Global Normalization Across All Frames**:
-   Dynamic re-normalization per frame causes distracting intensity flickering.
-   - Sample 3–5 representative slices (e.g. at 10%, 50%, and 90% of the volume) to establish global `vmin` and `vmax` bounds *before* starting the animation.
-4. **Clean Headless Backends**:
-   Always set `matplotlib.use("Agg")` prior to importing `pyplot`.
-5. **Animation Media Optimization**:
-   - For **Markdown / Web / Artifacts**: Export animated GIFs using `Pillow` writer with `fps = 10 - 15` and `dpi = 120 - 150`.
-   - For **Presentations / Large Datasets**: Export MP4 using `ffmpeg` writer with `bitrate = 1800`.
+The scripts render bin edges with `pcolormesh`, so the plot geometry comes from
+native coordinates rather than a square image with assumed axis order. Volume
+scans iterate the named axis's bin centers; integer-valued axis arrays are not
+interpreted as raw array indices.
 
----
+## Reciprocal metric
 
-## 2. Recipes
+Both CLIs accept `--coordinates auto|rlu|physical` and
+`--unit-cell a,b,c,alpha,beta,gamma`:
 
-### Recipe 1: Volume Axis Scanning (Scrolling along $L$)
+- `auto` is the default. A native or explicit unit cell selects physical geometry;
+  otherwise the display remains in r.l.u.
+- `rlu` shows named H/K/L coordinates on a rectangular schematic grid.
+- `physical` requires a valid cell and uses its full reciprocal metric, including
+  unequal reciprocal lengths and non-right inter-axis angles. No cubic fallback
+  is invented. An explicit cell overrides native metadata.
 
-```python
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from matplotlib.animation import FuncAnimation, PillowWriter
-import numpy as np
-import nexusformat.nexus as nx
-import gc
+Physical axes are plane-local Cartesian reciprocal coordinates in Å⁻¹, using the
+crystallographic convention without a factor of 2π. The horizontal direction is
+parallel to the first reciprocal basis vector in the plane; the vertical direction
+is perpendicular to it within that plane. The origin is the point where the two
+free indices are zero at the fixed index of the slice. These axes are not H/K/L
+in r.l.u.; equal plot aspect preserves physical lengths and angles.
 
-def animate_l_scan(nxs_path, out_gif, fps=12, stride=2):
-    nx.nxsetmemory(20000)
-    root = nx.nxload(nxs_path)
-    data = root.entry.data
+## Scroll through a volume
 
-    # Coordinate array along L (axis 2 in Legacy CHESS [H, K, L])
-    l_coords = np.asarray(data.nxaxes[2].nxdata)[::stride]
-    h_axis = np.asarray(data.nxaxes[0].nxdata)
-    k_axis = np.asarray(data.nxaxes[1].nxdata)
-
-    # 1. Establish robust global vmin and vmax from sample slices
-    sample_indices = [len(l_coords) // 4, len(l_coords) // 2, 3 * len(l_coords) // 4]
-    sample_slices = [np.asarray(data[:, :, l_coords[idx]].nxsignal.nxdata, dtype=np.float32) for idx in sample_indices]
-    pos = np.concatenate([s[s > 0] for s in sample_slices])
-    vmin = max(1.0, float(np.nanpercentile(pos, 5)))
-    vmax = float(np.nanpercentile(pos, 99.8))
-
-    # 2. Setup figure once
-    fig, ax = plt.subplots(figsize=(6, 5), dpi=140)
-    
-    # Initialize with first frame
-    initial_slice = np.asarray(data[:, :, l_coords[0]].nxsignal.nxdata, dtype=np.float32)
-    im = ax.imshow(
-        initial_slice.T,
-        origin="lower",
-        extent=[h_axis[0], h_axis[-1], k_axis[0], k_axis[-1]],
-        norm=LogNorm(vmin=vmin, vmax=vmax),
-        cmap="viridis",
-        aspect=1.0,
-    )
-    ax.set_xlabel(r"$H$ (r.l.u.)")
-    ax.set_ylabel(r"$K$ (r.l.u.)")
-    title_text = ax.set_title(f"$(HKL)$ Volume Scan: $L = {l_coords[0]:.2f}$ r.l.u.")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Intensity (counts)")
-
-    # 3. Update function
-    def update(frame_idx):
-        l_val = l_coords[frame_idx]
-        slice_2d = np.asarray(data[:, :, l_val].nxsignal.nxdata, dtype=np.float32)
-        im.set_data(slice_2d.T)
-        title_text.set_text(f"$(HKL)$ Volume Scan: $L = {l_val:.2f}$ r.l.u.")
-        return [im, title_text]
-
-    # 4. Render and export
-    anim = FuncAnimation(fig, update, frames=len(l_coords), blit=True)
-    writer = PillowWriter(fps=fps)
-    anim.save(out_gif, writer=writer)
-    plt.close(fig)
-    gc.collect()
-    print(f"Exported volume scan animation: {out_gif}")
+```bash
+python scripts/animate_volume.py \
+  --nxs path/to/volume.nxs --axis L --stride 2 --fps 12 \
+  --coordinates auto --output scroll_L.gif
 ```
 
----
+For explicit physical geometry:
 
-### Recipe 2: Temperature Series Evolution Animation
-
-```python
-import os
-import glob
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from matplotlib.animation import FuncAnimation, PillowWriter
-import numpy as np
-import nexusformat.nexus as nx
-import gc
-
-def animate_temp_series(temp_files_dict, out_gif, plane="HK", coord=0.0, fps=5):
-    """
-    temp_files_dict: dict mapping float(temperature_K) -> file_path
-    plane: 'HK', 'HL', or 'KL'
-    """
-    sorted_temps = sorted(temp_files_dict.keys())
-    
-    # Pre-load coordinate arrays and measure global intensity bounds
-    roots = {t: nx.nxload(temp_files_dict[t]) for t in sorted_temps}
-    
-    sample_slices = []
-    for t in sorted_temps[::max(1, len(sorted_temps) // 3)]:
-        data = roots[t].entry.data
-        sample_slices.append(np.asarray(data[:, :, coord].nxsignal.nxdata, dtype=np.float32))
-    pos = np.concatenate([s[s > 0] for s in sample_slices])
-    vmin = max(1.0, float(np.nanpercentile(pos, 5)))
-    vmax = float(np.nanpercentile(pos, 99.8))
-
-    # Initialize plot
-    fig, ax = plt.subplots(figsize=(6, 5), dpi=140)
-    data0 = roots[sorted_temps[0]].entry.data
-    slice0 = np.asarray(data0[:, :, coord].nxsignal.nxdata, dtype=np.float32)
-    h_axis = np.asarray(data0.nxaxes[0].nxdata)
-    k_axis = np.asarray(data0.nxaxes[1].nxdata)
-
-    im = ax.imshow(
-        slice0.T,
-        origin="lower",
-        extent=[h_axis[0], h_axis[-1], k_axis[0], k_axis[-1]],
-        norm=LogNorm(vmin=vmin, vmax=vmax),
-        cmap="viridis",
-        aspect=1.0,
-    )
-    ax.set_xlabel(r"$H$ (r.l.u.)")
-    ax.set_ylabel(r"$K$ (r.l.u.)")
-    title_text = ax.set_title(f"Temperature Evolution: $T = {sorted_temps[0]:.1f}$ K")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Intensity (counts)")
-
-    def update(frame_idx):
-        t = sorted_temps[frame_idx]
-        s = np.asarray(roots[t].entry.data[:, :, coord].nxsignal.nxdata, dtype=np.float32)
-        im.set_data(s.T)
-        title_text.set_text(f"Temperature Evolution: $T = {t:.1f}$ K")
-        return [im, title_text]
-
-    anim = FuncAnimation(fig, update, frames=len(sorted_temps), blit=True)
-    anim.save(out_gif, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-    gc.collect()
-    print(f"Exported temperature evolution animation: {out_gif}")
+```bash
+python scripts/animate_volume.py \
+  --nxs path/to/volume.nxs --axis L \
+  --coordinates physical --unit-cell 4,4,6,90,90,120 \
+  --vmin 1 --vmax 10000 --output scroll_L_physical.gif
 ```
 
----
+`--vmin`, `--vmax`, and `--cmap` control the existing fixed color scale. Bounds are
+sampled before rendering and remain unchanged between frames. This is useful for
+comparing intensities, but does not by itself establish intensity normalization
+between datasets.
 
-## 3. Standalone CLI Reference Scripts
+## Animate a verified temperature series
 
-This skill includes standalone CLI tools in [`scripts/`](./scripts/):
+```bash
+python scripts/animate_temp_series.py \
+  --pattern 'path/to/sample/[0-9]*/3rot_hkli.nxs' \
+  --plane HK --coord 0.0 --coordinates auto \
+  --output temperature_evolution.gif
+```
 
-1. **`animate_volume.py`**:
-   ```bash
-   python scripts/animate_volume.py --nxs path/to/volume.nxs --axis L --stride 2 --fps 12 --output scroll_L.gif
-   ```
-2. **`animate_temp_series.py`**:
-   ```bash
-   python scripts/animate_temp_series.py --dir path/to/sample_dir --file-pattern "*hkli*.nxs" --plane HK --coord 0.0 --output temp_evolution.gif
-   ```
+Use already verified temperature directories and a common reciprocal grid. Native
+storage order may differ between files; the slicer handles that. The display mesh
+and physical cell are taken from the first temperature. Grid registration,
+resampling and comparison of changing cells are not implemented here.
 
----
+## Deferred work and known limits
 
-## 4. Sister Skills & Integration
+The following issues are intentionally left for separate work:
 
-- For **Static 2D Slices & 3-Panel Summaries**: Consult [`reciprocal-space-plotting`](../reciprocal-space-plotting/SKILL.md).
-- For **1D Linecuts with Scissors**: Consult [`reciprocal-space-linecuts`](../reciprocal-space-linecuts/SKILL.md).
-- For **Batch Temperature Operations**: Consult [`temperature-series-analysis`](../temperature-series-analysis/SKILL.md).
+- **Temperature discovery and grid reconciliation:** the retained filename
+  heuristic can mistake digits in sample names for temperatures, and duplicate
+  temperatures overwrite one another. Inspect the selected temperatures and use
+  numeric temperature directories. Differing grids can still be displayed on the
+  first frame's mesh; these scripts do not validate or repair cross-temperature
+  registration, coverage, exposure or normalization.
+- **Masks and log normalization:** masks are passed through the shared slicer,
+  but the animation's sampled color-limit calculation has not been revised. Its
+  automatic lower bound is still at least 1, which is unsuitable for normalized
+  intensities below 1. Nonfinite values and mask-aware statistics need follow-up.
+  Both CLIs accept explicit `--vmin` and `--vmax` limits as a practical override;
+  this does not change the deferred automatic-normalization behavior.
+- **Export and memory:** only GIF is supported. A `.mp4` path is rejected before
+  loading data. Pillow keeps rendered frames in memory, so figure reuse does not
+  make long GIFs bounded-memory. MP4/streaming export and frame-budget handling
+  remain deferred. No scan-range or integration-window interface is added here.
+
+The figure and mesh are reused within each movie and closed even if saving fails.
+Do not describe that cleanup as a solution to Pillow's frame-buffer memory growth.
+
+## Related tools
+
+- [Static reciprocal slices](../reciprocal-space-plotting/SKILL.md)
+- [Linecuts](../reciprocal-space-linecuts/SKILL.md)
+- [Temperature-series analysis](../temperature-series-analysis/SKILL.md)
+
+Focused tests in [test_reciprocal_animation.py](../tests/test_reciprocal_animation.py)
+compare native axis orders, validate oblique physical geometry, and save/reopen
+tiny real GIFs. They do not validate a particular experimental dataset.

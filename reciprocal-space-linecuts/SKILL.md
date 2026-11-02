@@ -1,19 +1,30 @@
 ---
 name: reciprocal-space-linecuts
 description: >-
+  TO BE UPDATED: all standalone linecut work is deferred. Existing recipes and
+  CLI are historical and not validated for quantitative analysis.
   Extract, integrate, and visualize 1D reciprocal space linecuts from 3D NeXus datasets
   using Scissors from nxs_analysis_tools. Use when performing peak integration, linecuts
   along specific directions, background subtraction, extracting 1D profiles, or comparing
   Bragg and diffuse scattering intensities across cut windows.
 ---
 
-# 1D Reciprocal Space Linecuts Skill (`reciprocal-space-linecuts`)
+# 1D Reciprocal Space Linecuts — ALL TO BE UPDATED (`reciprocal-space-linecuts`)
 
-This skill provides operational procedures, coordinate ordering rules, and copy-paste-ready recipes for extracting 1D intensity linecuts from 3D reciprocal space volumes using `nxs_analysis_tools.Scissors`.
+> **TO BE UPDATED: all linecut work is deferred.** The recipes and CLI below are
+> retained as historical examples, not a supported quantitative workflow.
+> Known differences between Scissors and the fallback affect window size,
+> intensity reduction and missing-data handling. Background/error treatment and
+> export/memory behavior have not been repaired. Do not treat the examples below
+> as validated analysis. See [analysis status](../docs/reciprocal-analysis-status.md).
+
+The historical procedures and recipes below describe the existing
+`nxs_analysis_tools.Scissors` workflow. All remain **TO BE UPDATED** under the
+status above.
 
 ---
 
-## 1. Golden Rules of `Scissors` Linecuts
+## 1. Historical `Scissors` notes — TO BE UPDATED
 
 1. **Coordinate Ordering Trap**:
    `Scissors.cut_data()` maps `center` and `window` parameters **positionally to `data.nxaxes`**:
@@ -33,9 +44,9 @@ This skill provides operational procedures, coordinate ordering rules, and copy-
 
 ---
 
-## 2. Recipes
+## 2. Historical recipes — ALL TO BE UPDATED
 
-### Recipe 1: 1D Linecut on Legacy CHESS Dataset (`*hkli*.nxs`)
+### Recipe 1 — TO BE UPDATED: Legacy CHESS Dataset (`*hkli*.nxs`)
 
 ```python
 import matplotlib
@@ -83,7 +94,7 @@ print("Saved 1D linecut: linecut_H.png")
 
 ---
 
-### Recipe 2: 1D Linecut on NXRefine Dataset (`FeGeSb_300.nxs`)
+### Recipe 2 — TO BE UPDATED: NXRefine Dataset (`FeGeSb_300.nxs`)
 
 ```python
 import matplotlib
@@ -122,9 +133,11 @@ plt.close(fig)
 
 ---
 
-## 3. Standalone CLI Reference Script
+## 3. Standalone CLI — TO BE UPDATED
 
-Use [`scripts/extract_linecut.py`](./scripts/extract_linecut.py) for turnkey extraction:
+[`scripts/extract_linecut.py`](./scripts/extract_linecut.py) is retained for
+reference and emits a deferred-status warning. Its scientific behavior has not
+been repaired; the following historical invocation is **TO BE UPDATED**:
 
 ```bash
 python scripts/extract_linecut.py \

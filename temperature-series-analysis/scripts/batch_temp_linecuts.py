@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-batch_temp_linecuts.py: Apply batch Scissors cuts across all temperatures using TempDependence.
-Generates waterfall plots, (Q, T) intensity heatmaps, and exports linecut tables to CSV.
+batch_temp_linecuts.py: API compatibility repaired; detailed analysis TO BE UPDATED.
+Generates exploratory waterfall plots and (Q, T) intensity heatmaps. Discovery/grid
+validation, masks/log handling, and exports/memory work remain on hold. No CSV export.
 """
 
 import os
@@ -12,6 +13,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from temperature_api import API_STATUS, resolve_temperature_axis
 
 try:
     from nxs_analysis_tools.chess import TempDependence
@@ -30,6 +33,7 @@ def run_batch_linecuts(sample_dir, file_ending, cut_axis, center_str, window_str
     if TempDependence is None:
         raise ImportError("nxs_analysis_tools.chess.TempDependence is required to run batch_temp_linecuts.py")
 
+    print(API_STATUS)
     os.makedirs(outdir, exist_ok=True)
     td = TempDependence(sample_dir)
     print(f"Scanning for temperatures in {sample_dir}...")
@@ -49,21 +53,16 @@ def run_batch_linecuts(sample_dir, file_ending, cut_axis, center_str, window_str
     center = parse_tuple(center_str, 3)
     window = parse_tuple(window_str, 3)
 
-    td.set_center(center)
-    td.set_window(window)
-
-    axis_map = {"H": 0, "K": 1, "L": 2}
     cut_axis = cut_axis.upper()
-    if cut_axis not in axis_map:
-        raise ValueError(f"Invalid axis: {cut_axis}. Choose from H, K, L.")
-
-    axis_idx = axis_map[cut_axis]
+    axis_idx = resolve_temperature_axis(td, cut_axis)
     print(f"Executing batch cut along {cut_axis} across {len(td.temperatures)} temperatures...")
-    td.cut_data(axis=axis_idx, verbose=False)
+    td.cut_data(center=center, window=window, axis=axis_idx, verbose=False)
 
     # 1. Waterfall plot
     fig, ax = plt.subplots(figsize=(7, 8), dpi=200)
-    td.plot_linecuts(ax=ax, vertical_offset=float(offset), cmap="coolwarm")
+    # TempDependence chooses its own supported line colours; cmap is not a
+    # matplotlib Line2D argument accepted through this API's **kwargs.
+    td.plot_linecuts(ax=ax, vertical_offset=float(offset))
     ax.set_title(f"Temperature Waterfall through Center={center}")
     waterfall_path = os.path.join(outdir, "waterfall_linecuts.png")
     plt.tight_layout()
@@ -87,12 +86,12 @@ def run_batch_linecuts(sample_dir, file_ending, cut_axis, center_str, window_str
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract batch linecuts across temperatures using TempDependence.")
+    parser = argparse.ArgumentParser(description="Extract exploratory batch linecuts. " + API_STATUS)
     parser.add_argument("--sample-dir", "-s", required=True, help="Path to sample root containing temperature subdirectories")
     parser.add_argument("--file-ending", "-e", default="3rot_hkli_lite.nxs", help="NeXus file pattern (default: 3rot_hkli_lite.nxs)")
     parser.add_argument("--axis", required=True, choices=["H", "K", "L"], help="Direction of 1D cut")
-    parser.add_argument("--center", required=True, help="Center coordinate tuple: 'c0, c1, c2'")
-    parser.add_argument("--window", required=True, help="Window size tuple: 'w0, w1, w2'")
+    parser.add_argument("--center", required=True, help="Center tuple in native nxaxes order (HKL or LKH): 'c0,c1,c2'")
+    parser.add_argument("--window", required=True, help="Scissors half-width tuple in native nxaxes order: 'w0,w1,w2'")
     parser.add_argument("--unit-cell", default=None, help="Optional unit cell: 'a,b,c,alpha,beta,gamma'")
     parser.add_argument("--offset", type=float, default=500.0, help="Vertical offset between traces in waterfall plot")
     parser.add_argument("--outdir", "-o", default="./batch_linecuts", help="Destination output folder")
